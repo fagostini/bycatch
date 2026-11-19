@@ -1,0 +1,14 @@
+[package]
+name = "bycatch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+needletail = "0.6"
+# Not used directly: turns on the fast zlib backend for needletail's gzip reader.
+flate2 = { version = "1", features = ["zlib-rs"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+bytemuck = "1"
