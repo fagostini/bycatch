@@ -33,6 +33,15 @@ enum Cmd {
         #[arg(short, long, default_value_t = 4)]
         jobs: usize,
     },
+    /// Rewrite an index in the current, smaller layout; results stay the same
+    Repack {
+        /// Existing index prefix
+        #[arg(short, long)]
+        index: String,
+        /// Output prefix of the new index (must differ from --index)
+        #[arg(short, long)]
+        out: String,
+    },
     /// Scan a FASTQ file (plain or gzipped, `-` for stdin), or a read pair
     Scan {
         #[command(flatten)]
@@ -119,6 +128,7 @@ fn main() {
     let result = match Cmd::parse() {
         Cmd::Build { genomes, out, jobs } => index::build(&genomes, &out, jobs),
         Cmd::Add { index, genomes, out, jobs } => index::add(&index, &genomes, &out, jobs),
+        Cmd::Repack { index, out } => index::repack(&index, &out),
         Cmd::Scan { common, reads, unmatched_out, unmatched_n, mqc, name, r1, r2 } => {
             let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, ..common.opts() };
             let name = name.unwrap_or_else(|| sample_name(&r1));

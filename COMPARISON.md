@@ -52,7 +52,7 @@ These tools give a presence and abundance profile per sample, with no per-read c
 ## Where bycatch stands
 
 For a fixed list of up to 255 genomes, bycatch is exact, lean (15.4 GB for 23 genomes,
-31.4 Gb; 47.9 GB for 95 organisms, ~119 Gb) and needs no taxonomy. It falls behind on close relatives, divergent
+31.4 Gb; 45.8 GB for 95 organisms, ~119 Gb) and needs no taxonomy. It falls behind on close relatives, divergent
 contaminants, scale and statistics.
 
 **What bycatch does better**

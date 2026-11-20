@@ -123,6 +123,16 @@ byte-identical to building from the old list followed by the new one (tested), a
 the time of reading the new genomes plus one pass over the old index. The old index is
 kept; `--out` must differ from it. Up to 255 organisms in all.
 
+### Shrinking an index built before the id-sized layout
+
+```bash
+target/release/bycatch repack -i idx --out idx_small
+```
+
+Rewrites the index in the current layout (section 6) without reading genomes: for
+`count3` (95 organisms) the table goes from 4.3 to 2.15 GB in 3.5 min, and reports are
+byte-identical.
+
 ## How the reference index is built
 
 The index is one sorted array of entries. Each entry holds a 27-base k-mer and
@@ -183,9 +193,10 @@ in memory at once, so peak RAM depends on the largest genomes, not on how many t
 The per-genome runs are merged in one pass (a k-way merge with a heap, reading every
 run in order). For each distinct k-mer:
 
-- found in **one** genome: entry `kmer << 8 | organism_id`. This is a **marker** of
+- found in **one** genome: entry `kmer | organism_id`. This is a **marker** of
   that organism.
-- found in **two or more** genomes: one entry `kmer << 8 | 255`, the **shared** tag.
+- found in **two or more** genomes: one entry `kmer | all-ones id`, the **shared** tag
+  (255 with 8 id bits; section 6 says how many id bits an index uses).
 
 Shared entries are kept rather than deleted, so the scan can tell "sequence common to
 several references" apart from "sequence in none".
@@ -200,10 +211,14 @@ The 54-bit k-mer is split into a **prefix** (its top P bits) and the rest. Becau
 entries are sorted, all k-mers with the same prefix sit next to each other; the prefix
 table stores where each group starts.
 
-- **Large indexes** (2³⁰ entries or more, about 12 Gb of genomes and up): P = 30. The
-  prefix is no longer stored in the entry, so an entry holds the remaining 24 k-mer bits
-  and the 8-bit organism id: **4 bytes**. The table has 2³⁰ + 1 offsets of 4 bytes, 4 GB.
-  4 GB + 4 bytes per entry beats 8 bytes per entry from 2³⁰ entries on.
+- **Large indexes**: the organism id takes only the bits the organism count needs,
+  I = ⌈log₂(organisms + 1)⌉ (7 for 95 organisms, 5 for 23; the all-ones id is
+  `shared`), and P = 22 + I. The prefix is no longer stored in the entry, so an entry
+  holds the remaining 32 − I k-mer bits and the id: **4 bytes**. The table has 2ᴾ + 1
+  offsets of 4 bytes: 2 GB for P = 29, 4 GB for P = 30 (8 id bits, 128 organisms or
+  more). Used from 2ᴾ entries on, where table + 4 bytes per entry beats 8 bytes per entry.
+  Every id bit saved halves the table; entries stay 4 bytes and lookups return the same
+  results. Indexes built with P = 30 before this still load; `bycatch repack` converts them.
 - **Smaller indexes**: P is chosen so there are about 8 entries per prefix, and entries
   keep the full k-mer: `kmer << 8 | id`, **8 bytes**. The table is about 1/16 of the
   entries' size and only speeds up lookups.
@@ -211,8 +226,9 @@ table stores where each group starts.
 Offsets are stored as 32-bit values plus one 64-bit base per block of 2¹⁶ prefixes, so
 indexes with more than 2³² entries still work with a 4 GB table.
 
-For the 23-genome index (2.77 G entries) this gives 11.1 GB of entries + 4.3 GB of table
-= 15.4 GB, against 22.2 GB with 8-byte entries (−31 %). Classification is unchanged: the
+For the 23-genome index (2.77 G entries) this gave 11.1 GB of entries + 4.3 GB of table
+= 15.4 GB with P = 30, against 22.2 GB with 8-byte entries (−31 %); with 5 id bits
+(P = 27) the table is 0.54 GB, ~11.6 GB in all (not measured). Classification is unchanged: the
 same k-mers are stored with the same ids, in the same order, and reports on 16 real lane
 pairs were byte-identical with both layouts.
 
@@ -225,8 +241,9 @@ a group of about 2–3 entries. On one paired-end lane pair (~660 Mb):
 | 8-byte entries, no table | 7.2 s | 196 s |
 | 4-byte entries + prefix table | 3.5 s | 53 s |
 
-Index size scales as a fixed 4.3 GB table plus 0.35 bytes per base of genome, so about
-140 Gb of genomes fit in the 55 GB of free RAM on the test machine (75 Gb before).
+Index size scales as a fixed table (2.15 GB for 65 to 127 organisms) plus 0.35 bytes per
+base of genome, so about 145 Gb of genomes fit in the 55 GB of free RAM on the test
+machine (75 Gb with 8-byte entries).
 Details in [PERFORMANCE.md](PERFORMANCE.md).
 
 ### 7. Output files
@@ -260,7 +277,9 @@ that genome, and host reads with read-through became `conflict`.
   and stay in the page cache, shared by every scan running at the same time.
 - Keep the index off encrypted home folders (ecryptfs): they cache every page twice,
   encrypted and decrypted, so a 48 GB index never stays in a 61 GB machine's page cache.
-  A full scan of one lane took 966 s from there and 37.6 s from `/var/tmp`.
+  A full scan of one lane took 966 s from there and 37.6 s from `/var/tmp`; with the
+  index and the input warm in page cache, 3.3 s today (see PERFORMANCE.md).
+  FASTQ input is read once, front to back, so it can stay in the encrypted home.
 - R1 is read in full on its own thread. Only record 1, 1 + N, 1 + 2N, … is classified
   (`--every N`); the rest is decompressed and skipped. Taking every Nth read, not the
   first reads, means every part of the run (all tiles, all of the file) is represented.
@@ -408,8 +427,8 @@ or run sylph against GTDB, to find organisms missing from the index.
 | File | Content |
 |---|---|
 | `src/kmer.rs` | 2-bit encoding, canonical k-mers, hash, low-complexity filter, minimizers |
-| `src/index.rs` | build and add (per-genome runs, merge, prefix table), `.meta` format, load, lookup |
-| `src/scan.rs` | sampling, reader threads, parallel classification, adapters, duplicates, Wilson intervals, EM, `--precision`, report |
+| `src/index.rs` | build, add and repack (per-genome runs, merge, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
+| `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, duplicates, Wilson intervals, EM, `--precision`, report |
 | `src/run.rs` | `run`: many samples, matrix, background / elevated / index-hopping flags, MultiQC files |
 | `src/main.rs` | command line |
 | `tests/synthetic.rs` | end-to-end test on three random genomes sharing a block: scan, threads, adapters, `--precision`, `add`, `run`, MultiQC |

@@ -2,8 +2,8 @@
 
 All numbers were measured on this workstation (16 cores, 61 GB RAM, NVMe disk)
 with the current design: canonical 27-mers, window minimizers with w = 15, and a
-memory-mapped, sorted index with a prefix table (4-byte entries for indexes of 2³⁰
-entries or more, 8-byte entries below). Rows marked *8-byte* were measured before the
+memory-mapped, sorted index with a prefix table (4-byte entries for large indexes,
+8-byte entries below). Rows marked *8-byte* were measured before the
 compact layout existed.
 
 ## 1. Measured performance
@@ -17,10 +17,12 @@ compact layout existed.
 | `all23` (8-byte) | 23 genomes, 13 of them ≥ 1 Gb | 31.4 Gb | 22.2 GB | 324 s | 14.2 GB (the old build would have needed ~46 GB) |
 | `all23c` (compact) | same 23 genomes | 31.4 Gb | **15.4 GB** (11.1 GB entries + 4.3 GB table) | 333 s | 14.1 GB |
 | `count3` (compact, adapter-masked) | 95 organisms: 23 above, 50 from a run's organism list, 11 microbes, 16 class representatives, RefSeq viruses | ~119 Gb | **47.9 GB** (43.6 GB entries + 4.3 GB table) | 49 min (`--jobs 3`) | 13.6 GB |
+| `count3r` (`count3` repacked, 7 id bits) | same 95 | ~119 Gb | **45.8 GB** (43.6 GB entries + 2.15 GB table) | 3.5 min (`repack`) | 46.8 GB RSS, mostly the mapped old index |
 
 - Index size grows **linearly** with total genome size: 0.06–0.12 minimizers per base.
-  With 4-byte entries that is **0.35 bytes per base** plus the fixed 4.3 GB table
-  (0.49 bytes per base overall for `all23c`); with 8-byte entries it was 0.71 bytes per base
+  With 4-byte entries that is **0.35 bytes per base** plus a fixed table of 2ᴵ × 16.8 MB for
+  I id bits (2.15 GB for 65–127 organisms, 4.3 GB for 128 or more; `all23c` was built with
+  4.3 GB, 0.49 bytes per base overall); with 8-byte entries it was 0.71 bytes per base
   (2.77 G entries for 31.4 Gb). `count3` measured 0.37 bytes per base of entries.
 - Repeat-rich genomes cost less per base, because a repeated k-mer is stored once:
   common toad 0.058 and nettle 0.064 minimizers per base, against about 0.10 for mammals.
@@ -46,6 +48,21 @@ index warm in page cache:
 `count3` (47.9 GB), R1 only of lane A (2.22 M reads), `-t 8`, index in
 `/var/tmp`: **1.9 s** at `--every 50`, **37.6 s** at `--every 1`, 47.8 GB RSS. The same scans
 with the index in the ecryptfs home took 43 s and 966 s (see Hard limits).
+
+Re-measured 2026-11-20 with the index and the FASTQs read into page cache (`cat`) before
+every run, inputs read in place from the run folder in the home directory, 3 runs each:
+
+| Index and binary | R1 `--every 50` | R1 `--every 1` | R1 + R2 `--every 1` |
+|---|---|---|---|
+| `count3`, binary before prefetch and LTO | 1.0 s | 4.2–4.6 s | 8.3–9.0 s |
+| `count3`, prefetch + LTO | 1.0 s | 3.3–3.4 s | 6.4–6.6 s |
+| `count3r` (7 id bits), prefetch + LTO | 0.9 s | 3.3–3.5 s | 6.5–6.9 s |
+
+All reports and `--reads` files byte-identical. The 37.6 s above was not reproduced
+with a warm cache: with ~48 GB of index in 61 GB of RAM, a partly evicted index slows
+a scan several-fold (one run today took 28 s instead of 4 s), so warm the index before
+timing. Run-to-run spread is ±5 %; alternating the two layouts (6 runs each, other
+index evicted) gave R1 3.28 vs 3.27 s and pair 5.09 vs 5.18 s.
 
 The 16 lane pairs used for benchmarking gave byte-identical reports with both indexes.
 The earlier runs below used the 8-byte index:
@@ -142,7 +159,7 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 |---|---|---|
 | Organisms per index | 255 | 8-bit organism id; 255 is the `shared` tag |
 | Index size | must fit in free RAM (page cache) | lookups are random; from disk the scan is orders of magnitude slower |
-| On this machine | ~55 GB free → ~140 Gb of genomes | 4.3 GB table + 0.35 bytes per base; `count3` (47.9 GB) uses most of it |
+| On this machine | ~55 GB free → ~145 Gb of genomes | 2.15 GB table (65–127 organisms) + 0.35 bytes per base; `count3r` (45.8 GB) uses most of it |
 | Encrypted home (ecryptfs) | index must live elsewhere | ecryptfs caches each page twice (encrypted and decrypted), so the index needs twice its size in RAM; `count3` scans were 25× slower from there |
 | Read length | ≥ 41 bp for at least one minimizer, ≥ ~100 bp for reliable calls | w = 15, k = 27, 2-hit rule |
 | k-mer length | fixed at 27 | `kmer << 8 \| id` must fit in 64 bits |
@@ -156,6 +173,7 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 
 | Strategy | Effect on `all23c` (15.4 GB) | Cost | Recommendation |
 |---|---|---|---|
+| **Id bits sized to the organism count** (done; `repack` for old indexes) | table halves per id bit saved: −2.15 GB for `count3` (95 organisms), −3.8 GB for `all23c` (23) | none: byte-identical reports; `--every 1` pair +1.9 %, within noise | Default |
 | **Drop `shared` entries** from the index | −1.3 % | `shared` reads become `unmatched` | Not worth it |
 | **Group strains / close relatives** under one name | keeps markers unique; no extra space | cannot tell grouped organisms apart | Use when needed |
 | **Leave out organelles and plasmids** | small | lose mitochondrial/chloroplast detection | Optional; also reduces 16S-like false hits from chloroplasts |

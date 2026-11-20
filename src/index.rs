@@ -1,11 +1,11 @@
-//! Reference index: sorted entries `key << 8 | organism_id`, plus a table of where each
-//! k-mer prefix starts.
+//! Reference index: sorted entries `key << id_bits | organism_id`, plus a table of where
+//! each k-mer prefix starts.
 //!
-//! The table splits the k-mers by their top `prefix_bits` bits. Large indexes (2^30
-//! entries or more) use 30 prefix bits: the table then takes 4 GB, but each entry only
-//! needs the remaining 24 k-mer bits plus the id, so entries shrink from 8 to 4 bytes.
-//! Smaller indexes keep 8-byte entries with the full k-mer and a small table that only
-//! speeds up lookups.
+//! The table splits the k-mers by their top `prefix_bits` bits. Large indexes use 4-byte
+//! entries: the id takes as few bits as the organism count needs (7 for 95 organisms)
+//! and the rest of the k-mer goes in the table, `22 + id_bits` prefix bits (2^29 slots,
+//! 2 GB, for 7 id bits). Smaller indexes keep 8-byte entries with the full k-mer, 8 id
+//! bits and a small table that only speeds up lookups.
 use crate::kmer::{kmers_at, minimizers, K, W};
 use crate::scan::{adapter_kmers, ADAPTER_K};
 use crate::Res;
@@ -20,19 +20,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const SHARED: u8 = 255;
 
 const KMER_BITS: u32 = 2 * K as u32;
-/// 30 prefix bits leave 24 k-mer bits + 8 id bits: a 4-byte entry.
-const COMPACT_PREFIX_BITS: u32 = 30;
+/// k-mer bits that do not fit a 4-byte entry with no id: the least prefix bits.
+const COMPACT_BASE_BITS: u32 = KMER_BITS - 32;
+/// 8 id bits, the most there are, leave 24 k-mer bits in a 4-byte entry.
+const COMPACT_MAX_PREFIX_BITS: u32 = COMPACT_BASE_BITS + 8;
 /// The table stores offsets as u32, plus one u64 base per block of 2^16 prefixes.
 const BLOCK_BITS: u32 = 16;
 
-/// Prefix bits and entry size for an index of about `n` entries.
-fn layout(n: u64) -> (u32, usize) {
-    if n >= 1 << COMPACT_PREFIX_BITS {
-        // 4 GB table + 4 bytes per entry is no larger than 8 bytes per entry from here on
-        (COMPACT_PREFIX_BITS, 4)
+/// Prefix bits, entry size and id bits for an index of about `n` entries of `organisms`.
+fn layout(n: u64, organisms: usize) -> (u32, usize, u32) {
+    // ids 0..organisms, plus the all-ones id for shared k-mers
+    let id_bits = usize::BITS - organisms.leading_zeros();
+    let prefix_bits = COMPACT_BASE_BITS + id_bits;
+    if n >= 1 << prefix_bits {
+        // table (4 bytes per prefix) + 4 bytes per entry is no larger than 8 bytes per entry from here on
+        (prefix_bits, 4, id_bits)
     } else {
         // about 8 entries per prefix: table is 1/16 of the entries' size
-        ((63 - n.max(16).leading_zeros()) - 3, 8)
+        ((63 - n.max(16).leading_zeros()) - 3, 8, 8)
     }
 }
 
@@ -153,6 +158,17 @@ pub fn add(old: &str, list: &str, out: &str, jobs: usize) -> Res<()> {
     result
 }
 
+/// Writes the index `old` again at `out` in the current layout (fewer id bits, so a
+/// smaller table). Same k-mers and ids: lookups give the same results.
+pub fn repack(old: &str, out: &str) -> Res<()> {
+    if old == out {
+        return Err("repack: --out must differ from the old index, which is read while the new one is written".into());
+    }
+    let idx = Index::load(old)?;
+    let names: Vec<&str> = idx.names.iter().map(String::as_str).collect();
+    merge(vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0 })], &names, &idx.totals, out)
+}
+
 /// Sorted (k-mer, organism id) pairs, each k-mer once.
 trait Source {
     fn next(&mut self) -> Res<Option<(u64, u8)>>;
@@ -203,12 +219,12 @@ impl Source for OldIndex<'_> {
             while idx.offset(self.prefix + 1) <= self.pos {
                 self.prefix += 1;
             }
-            (self.prefix as u64) << (KMER_BITS - idx.prefix_bits) | e >> 8
+            (self.prefix as u64) << (KMER_BITS - idx.prefix_bits) | e >> idx.id_bits
         } else {
             e >> 8
         };
         self.pos += 1;
-        Ok(Some((kmer, e as u8)))
+        Ok(Some((kmer, idx.id(e))))
     }
 }
 
@@ -254,7 +270,8 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], ou
         }
     }
     // shared k-mers collapse, so the final count is a little lower: close enough for the layout
-    let (prefix_bits, entry_bytes) = layout(totals.iter().sum());
+    let (prefix_bits, entry_bytes, id_bits) = layout(totals.iter().sum(), names.len());
+    let shared_id = (1u64 << id_bits) - 1;
     let suffix_bits = KMER_BITS - prefix_bits;
     let key_mask = if entry_bytes == 4 { (1u64 << suffix_bits) - 1 } else { u64::MAX };
     let path = format!("{out}.kmers");
@@ -282,9 +299,9 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], ou
         if id != SHARED {
             unique[id as usize] += 1;
         }
-        let id = id as u64;
+        let id = if id == SHARED { shared_id } else { id as u64 };
         table.advance_to(kmer >> suffix_bits)?;
-        let entry = (kmer & key_mask) << 8 | id;
+        let entry = (kmer & key_mask) << id_bits | id;
         if entry_bytes == 4 {
             w.write_all(&(entry as u32).to_ne_bytes())?;
         } else {
@@ -365,6 +382,8 @@ pub struct Index {
     entry_bytes: usize,
     /// bits of the k-mer stored in an entry
     key_mask: u64,
+    /// low bits of an entry holding the organism id; all ones means shared
+    id_bits: u32,
     len: usize,
     pub names: Vec<String>,
     /// unique marker k-mers per organism
@@ -391,10 +410,10 @@ fn prefetch(p: &u8) {
     let _ = p;
 }
 
-/// First entry in `v` whose key is >= `key`, if equal: (position, id).
-fn find<T: Copy + Into<u64>>(v: &[T], key: u64) -> Option<(usize, u8)> {
-    let i = v.partition_point(|&e| e.into() >> 8 < key);
-    (i < v.len() && v[i].into() >> 8 == key).then(|| (i, v[i].into() as u8))
+/// Position of the entry in `v` with this key, if any.
+fn find<T: Copy + Into<u64>>(v: &[T], key: u64, id_bits: u32) -> Option<usize> {
+    let i = v.partition_point(|&e| e.into() >> id_bits < key);
+    (i < v.len() && v[i].into() >> id_bits == key).then_some(i)
 }
 
 impl Index {
@@ -412,9 +431,11 @@ impl Index {
             ("contam2", [p, b]) => (p.parse()?, b.parse()?, true),
             _ => return Err(bad().into()),
         };
-        if !(entry_bytes == 8 || entry_bytes == 4 && prefix_bits == COMPACT_PREFIX_BITS) || prefix_bits > COMPACT_PREFIX_BITS {
+        let compact = entry_bytes == 4 && (COMPACT_BASE_BITS + 1..=COMPACT_MAX_PREFIX_BITS).contains(&prefix_bits);
+        if !(entry_bytes == 8 || compact) || prefix_bits > COMPACT_MAX_PREFIX_BITS {
             return Err(bad().into());
         }
+        let id_bits = if entry_bytes == 4 { prefix_bits - COMPACT_BASE_BITS } else { 8 };
         let (mut names, mut markers, mut totals) = (Vec::new(), Vec::new(), Vec::new());
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
@@ -424,6 +445,9 @@ impl Index {
             names.push(f[0].to_string());
             totals.push(f[1].parse()?);
             markers.push(f[2].parse()?);
+        }
+        if names.len() >= 1 << id_bits {
+            return Err(format!("{meta_path}: {} organisms do not fit {id_bits} id bits", names.len()).into());
         }
         let kmers_path = format!("{prefix}.kmers");
         let entries = map(&kmers_path)?;
@@ -442,7 +466,7 @@ impl Index {
             None
         };
         let key_mask = if entry_bytes == 4 { (1u64 << (KMER_BITS - prefix_bits)) - 1 } else { u64::MAX };
-        let idx = Index { entries, table, prefix_bits, entry_bytes, key_mask, len, names, markers, totals };
+        let idx = Index { entries, table, prefix_bits, entry_bytes, key_mask, id_bits, len, names, markers, totals };
         if idx.table.is_some() && idx.offset(1 << prefix_bits) != len {
             return Err(format!("{prefix}.table: does not match {kmers_path}").into());
         }
@@ -452,6 +476,15 @@ impl Index {
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Organism id of an entry, `SHARED` for the all-ones id.
+    fn id(&self, entry: u64) -> u8 {
+        let mask = (1u64 << self.id_bits) - 1;
+        match entry & mask {
+            m if m == mask => SHARED,
+            id => id as u8,
+        }
     }
 
     /// Position of the first entry with this k-mer prefix (needs the table).
@@ -501,12 +534,13 @@ impl Index {
     /// `lookup` within a `range`.
     pub fn find_in(&self, kmer: u64, lo: usize, hi: usize) -> Option<(usize, u8)> {
         let key = kmer & self.key_mask;
-        let hit = if self.entry_bytes == 4 {
-            find(&bytemuck::cast_slice::<u8, u32>(&self.entries)[lo..hi], key)
+        if self.entry_bytes == 4 {
+            let v = &bytemuck::cast_slice::<u8, u32>(&self.entries)[lo..hi];
+            find(v, key, self.id_bits).map(|i| (lo + i, self.id(v[i] as u64)))
         } else {
-            find(&bytemuck::cast_slice::<u8, u64>(&self.entries)[lo..hi], key)
-        };
-        hit.map(|(i, id)| (lo + i, id))
+            let v = &bytemuck::cast_slice::<u8, u64>(&self.entries)[lo..hi];
+            find(v, key, 8).map(|i| (lo + i, self.id(v[i])))
+        }
     }
 }
 
@@ -529,6 +563,56 @@ mod tests {
         // reverse complement too
         let rc: Vec<u8> = seq.iter().rev().map(|&c| match c { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' }).collect();
         assert!(mask_adapters(&rc).unwrap()[a..b].iter().all(|&c| c == b'N'));
+    }
+
+    struct VecSource(std::vec::IntoIter<u64>, u8);
+    impl Source for VecSource {
+        fn next(&mut self) -> Res<Option<(u64, u8)>> {
+            Ok(self.0.next().map(|k| (k, self.1)))
+        }
+    }
+
+    /// The compact layout with few id bits, and `repack`, give the same lookups as the
+    /// 8-byte layout. Fake genome totals force the layout; they only choose it.
+    #[test]
+    fn compact_layout_matches() {
+        let dir = std::env::temp_dir().join(format!("bycatch_layout_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        let mut x = 7u64;
+        let mut rand = || {
+            x = crate::kmer::mix(x.wrapping_add(0x9e3779b97f4a7c15));
+            x >> (64 - KMER_BITS)
+        };
+        let a: Vec<u64> = (0..20_000).map(|_| rand()).collect();
+        let mut b: Vec<u64> = (0..20_000).map(|_| rand()).collect();
+        b.extend(&a[..500]); // shared
+        let absent: Vec<u64> = (0..1000).map(|_| rand()).collect();
+        let (mut a, mut b) = (a, b);
+        a.sort_unstable();
+        a.dedup();
+        b.sort_unstable();
+        b.dedup();
+        let sources = || -> Vec<Box<dyn Source>> {
+            vec![Box::new(VecSource(a.clone().into_iter(), 0)), Box::new(VecSource(b.clone().into_iter(), 1))]
+        };
+        let names = ["a", "b"];
+        merge(sources(), &names, &[10, 10], &p("wide")).unwrap();
+        merge(sources(), &names, &[1 << 24, 0], &p("compact")).unwrap();
+        let (wide, compact) = (Index::load(&p("wide")).unwrap(), Index::load(&p("compact")).unwrap());
+        assert_eq!((wide.entry_bytes, compact.entry_bytes, compact.id_bits, compact.prefix_bits), (8, 4, 2, 24));
+        repack(&p("compact"), &p("repacked")).unwrap();
+        let repacked = Index::load(&p("repacked")).unwrap();
+        let mut shared = 0;
+        for &k in a.iter().chain(&b).chain(&absent) {
+            let w = wide.lookup(k);
+            assert_eq!(w, compact.lookup(k), "k-mer {k}");
+            assert_eq!(w, repacked.lookup(k), "k-mer {k}");
+            shared += (w.map(|h| h.1) == Some(SHARED)) as usize;
+        }
+        assert_eq!(shared, 2 * 500); // each shared k-mer is in both a and b
+        assert!(absent.iter().all(|&k| wide.lookup(k).is_none()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `add` reads an index back through OldIndex. Checks on a real index that the decoded
