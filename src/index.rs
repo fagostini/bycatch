@@ -379,6 +379,18 @@ fn map(path: &str) -> Res<memmap2::Mmap> {
     Ok(unsafe { memmap2::Mmap::map(&file)? })
 }
 
+/// Cache hint only: never changes a result.
+#[inline(always)]
+fn prefetch(p: &u8) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: prefetch does not access memory architecturally; `p` is a valid reference anyway.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const u8 as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 /// First entry in `v` whose key is >= `key`, if equal: (position, id).
 fn find<T: Copy + Into<u64>>(v: &[T], key: u64) -> Option<(usize, u8)> {
     let i = v.partition_point(|&e| e.into() >> 8 < key);
@@ -453,14 +465,41 @@ impl Index {
     }
 
     /// Position in the index and organism id (or `SHARED`) of a canonical k-mer.
+    #[cfg(test)]
     pub fn lookup(&self, kmer: u64) -> Option<(usize, u8)> {
-        let (lo, hi) = match self.table {
+        let (lo, hi) = self.range(kmer);
+        self.find_in(kmer, lo, hi)
+    }
+
+    /// Entries that may hold this k-mer: those with its prefix.
+    pub fn range(&self, kmer: u64) -> (usize, usize) {
+        match self.table {
             Some(_) => {
                 let p = (kmer >> (KMER_BITS - self.prefix_bits)) as usize;
                 (self.offset(p), self.offset(p + 1))
             }
             None => (0, self.len),
-        };
+        }
+    }
+
+    /// Starts loading the table slot of this k-mer into cache, so that lookups of many
+    /// k-mers wait for memory at the same time instead of one after another.
+    pub fn prefetch_table(&self, kmer: u64) {
+        if let Some(t) = &self.table {
+            let p = (kmer >> (KMER_BITS - self.prefix_bits)) as usize;
+            prefetch(&t[8 * n_blocks(self.prefix_bits) + 4 * p]);
+        }
+    }
+
+    /// Starts loading the first entry of a `range` into cache.
+    pub fn prefetch_entries(&self, lo: usize) {
+        if let Some(e) = self.entries.get(lo * self.entry_bytes) {
+            prefetch(e);
+        }
+    }
+
+    /// `lookup` within a `range`.
+    pub fn find_in(&self, kmer: u64, lo: usize, hi: usize) -> Option<(usize, u8)> {
         let key = kmer & self.key_mask;
         let hit = if self.entry_bytes == 4 {
             find(&bytemuck::cast_slice::<u8, u32>(&self.entries)[lo..hi], key)

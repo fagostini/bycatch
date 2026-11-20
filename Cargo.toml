@@ -12,3 +12,7 @@ rayon = "1"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 bytemuck = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -236,7 +236,10 @@ fn dup_key(f: &Fragment) -> Option<u64> {
     Some(mix(bytes.fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))))
 }
 
-fn classify(idx: &Index, seen: &[AtomicU64], f: &Fragment, mins: &mut Vec<u64>) -> Call {
+/// Per-thread scratch space of `classify`: minimizers, and their index ranges.
+type Scratch = (Vec<u64>, Vec<(usize, usize)>);
+
+fn classify(idx: &Index, seen: &[AtomicU64], f: &Fragment, (mins, ranges): &mut Scratch) -> Call {
     mins.clear();
     minimizers(&f.seq, mins);
     if let Some(m) = &f.mate {
@@ -244,9 +247,15 @@ fn classify(idx: &Index, seen: &[AtomicU64], f: &Fragment, mins: &mut Vec<u64>) 
     }
     mins.sort_unstable();
     mins.dedup();
+    // Lookups are random memory reads: issue all of one stage before using any, so
+    // the cache misses of a fragment overlap.
+    mins.iter().for_each(|&k| idx.prefetch_table(k));
+    ranges.clear();
+    ranges.extend(mins.iter().map(|&k| idx.range(k)));
+    ranges.iter().for_each(|r| idx.prefetch_entries(r.0));
     let (mut hits, mut shared) = (Vec::<(usize, u32, u32)>::new(), 0);
-    for &kmer in mins.iter() {
-        match idx.lookup(kmer) {
+    for (&kmer, &(lo, hi)) in mins.iter().zip(ranges.iter()) {
+        match idx.find_in(kmer, lo, hi) {
             None => {}
             Some((_, SHARED)) => shared += 1,
             Some((pos, id)) => {
@@ -558,7 +567,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     let pool = rayon::ThreadPoolBuilder::new().num_threads(opts.threads).build()?;
     for batch in rx {
         let calls: Vec<Call> =
-            pool.install(|| batch.par_iter().map_init(Vec::new, |mins, f| classify(idx, &seen, f, mins)).collect());
+            pool.install(|| batch.par_iter().map_init(Scratch::default, |s, f| classify(idx, &seen, f, s)).collect());
         // fold in input order, so reports and --reads are the same with any number of threads
         for (f, c) in batch.iter().zip(&calls) {
             sampled += 1;

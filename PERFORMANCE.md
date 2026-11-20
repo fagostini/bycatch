@@ -196,7 +196,13 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
   compete for memory bandwidth. Reports and `--reads` files were byte-identical to the old
   ones (apart from the new columns) and between thread counts; so were the reports of all
   16 benchmark lane pairs at `--every 50`.
-  Still open: prefetch or sort the lookups of a batch, so neighbouring k-mers share cache lines.
+  `classify` now prefetches the table slots of all of a fragment's minimizers, then the
+  first entry of each range, before searching any, so the cache misses overlap. With
+  fat LTO (`[profile.release]`) on top, measured on `count3`, lane A, `-t 8`, warm
+  cache, best of 3: R1 `--every 1` 4.2 → 3.3 s, the pair `--every 1` 8.3 → 6.4 s;
+  `--every 50` unchanged at 1.0 s (decompression bound). Reports and `--reads` files
+  byte-identical. Tried and dropped, both measured slower: a plain load before the
+  bitmap's `fetch_or`, and a calloc'd (lazily zeroed) bitmap.
 - **Build time** (5.4 min for 31 Gb) is dominated by parsing and sorting each genome.
   `--jobs` above 4 helps if RAM allows. Adding genomes does not need a rebuild:
   `bycatch add` reads only the new genomes plus one pass over the old index (decoding
