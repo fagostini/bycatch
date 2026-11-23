@@ -13,7 +13,9 @@ is assigned to an organism when it has at least 2 marker hits and that organism 
 least 90 % of them. A `diversity` score flags organisms whose hits pile onto a few markers.
 
 Kraken2 and sourmash were run on bycatch's data on 2026-11-20/21 (see "Measured head-to-head"
-below). Bracken, centrifuger, sylph and mash are installed but not yet run.
+below). Three tools written in Rust, deacon, Kun-peng and sylph, were run on the same data on
+2026-11-23 (see "Measured head-to-head: Rust tools"). Bracken, centrifuger and mash are
+installed but not yet run.
 
 ## Measured head-to-head: Kraken2 and sourmash (2026-11-21)
 
@@ -110,9 +112,107 @@ unclassified at confidence 0, 11.55 % at 0.1.
   - sourmash is about 70× smaller than bycatch.
 - **Still not measured**:
   - Divergent contaminants, i.e. a strain or species missing from the reference.
-  - Bracken, sylph.
+  - Bracken.
   - Kraken2 with a real NCBI taxonomy, where a shared minimizer can go to a genus or family
     instead of the root.
+
+## Measured head-to-head: Rust tools (2026-11-23)
+
+The Rust tools closest to bycatch, run on the same machine, genomes and reads as above.
+bycatch, Kraken2 and sourmash were not run again: their rows are in the tables above, and
+were timed on 2026-11-21. Work files are in `/var/tmp/bench_rust`; scripts are in
+`data/bench/rust_cmp/`.
+
+- **deacon 0.20.0** (cargo): a minimizer filter for host depletion, k = 31, w = 15. A read is
+  a match with at least 2 distinct minimizer hits and at least 1 % of its minimizers
+  (defaults). It only answers "matches this index or not", so it was run with two indexes:
+  - the host (human for the simulated sets, cod for lane A);
+  - a contaminant index: the union of all other genomes, minus every minimizer of the host
+    (`deacon index union`, then `index diff`). This mirrors bycatch's `shared` for the host,
+    but not between two contaminants.
+  - Reads are counted as non-host when they hit the contaminant index. "Contaminant only"
+    leaves out reads that also hit the host.
+  - Pairs are scored as one fragment.
+- **Kun-peng 0.7.5** (cargo): a Kraken2-style classifier with the database split into chunks.
+  Defaults (k = 35, ℓ = 31, confidence 0, 2 hit groups), and the same flat taxonomy as for
+  Kraken2. Run at `-T 0` and `0.1`.
+  - **10 genomes only.** Its build writes temporary chunk files: the 10-genome build filled
+    the last 66 GB of the disk on its first try. The 23-genome build would need about 200 GB,
+    so Kun-peng was not run on lane A.
+- **sylph 0.9.0**: defaults (c = 200, k = 31). `sylph query` gives the containment ANI and
+  effective coverage of each genome. `sylph profile` adds abundances, but its k-mer
+  reassignment step runs on one thread: on short10, and on lane A with only cod left to
+  reassign, it ran 11 min without finishing, and was stopped.
+
+### Build
+
+| | deacon | Kun-peng | sylph |
+|---|---|---|---|
+| 10 genomes: time | 27 s (10 indexes) + 13 min 26 s union + 26 s diff | 9 min 7 s | 18 s |
+| 10 genomes: size, peak RAM | 7.6 GB (host 2.5 + contaminant 5.1), 18.9 GB | 13.9 GB, 34.5 GB; ≥ 66 GB temporary disk | 294 MB, 2.3 GB |
+| 23 genomes: time | 88 s + 37 min union + 4 min 24 s diff | not built | 41 s |
+| 23 genomes: size, peak RAM | 23.0 GB (host 0.5 + contaminant 22.5), 54.2 GB | — | 879 MB, 7.2 GB |
+
+deacon builds one genome's index fast (10 s for human), but `index union` runs on one thread
+and takes most of the build time.
+
+### Simulated reads
+
+Same sets as above: short10 is 10.553 % non-human, long10 is 10.600 %.
+
+| Tool | Set | Correct | Wrong organism | Not assigned | Non-human estimate | Wall time | RSS |
+|---|---|---|---|---|---|---|---|
+| deacon | short10 | — | 54 human reads hit the contaminant index (0.011 %) | 36 non-human reads hit neither or only human | 10.557 % (contaminant only: 10.418 %) | 4.0 s host + 8.6 s contaminant† | 4.7 / 9.5 GB |
+| Kun-peng c 0 | short10 | 99.963 % | 11 (0.002 %) | 0.035 % | 10.550 % | 8.2 s | 8.4 GB |
+| Kun-peng c 0.1 | short10 | 99.929 % | 2 | 0.071 % | 10.543 % | 8.1 s | 8.4 GB |
+| sylph query | short10 | — | — | — | finds 8 of 10 genomes; no lsinapis, no phiX | 19.5 s | 0.6 GB |
+| deacon | long10 | — | 5 human reads (0.025 %) | 0 | 10.625 % (contaminant only: 10.295 %) | 4.0 s + 8.3 s† | 5.0 / 9.6 GB |
+| Kun-peng c 0 | long10 | 100 % | 0 | 0 | 10.600 % | 6.8 s | 8.4 GB |
+| Kun-peng c 0.1 | long10 | 94.645 % | 0 | 5.355 % | 5.585 % | 6.5 s | 8.4 GB |
+| sylph query | long10 | — | — | — | finds 4 of 10 genomes | 18.3 s | 0.4 GB |
+
+† Most of deacon's time goes on loading the index. The simulated runs shared the machine with
+a one-thread `index union`.
+
+- Kun-peng makes 11 wrong calls on short10 at confidence 0, where Kraken2 made 510 with the
+  same k, ℓ and taxonomy. One difference: the Kraken2 database was built with low-complexity
+  masking, Kun-peng's without.
+- At confidence 0.1 Kun-peng leaves 5.4 % of long10 unassigned, almost all from the small
+  genomes: 2 of 89 phiX reads are assigned, 22 of 281 *Drosophila*, 15 of 99 *E. coli*.
+  Kraken2 at 0.1 lost 0.385 %. This was not investigated.
+- deacon's non-human estimate is close to the truth, but 639 non-human short reads also hit
+  the human index. Without the contaminant index there is no way to tell them apart.
+- sylph is built for samples with more coverage. Here every genome is at 0.005–0.08×
+  effective coverage. On short10 mouse and dog get ANI 92 %, although the reads come from
+  the reference itself.
+
+### Real lane (lane A, cod, 2,223,665 pairs)
+
+| Tool | Cod | Non-cod in total | Largest non-cod | Time | RSS |
+|---|---|---|---|---|---|
+| deacon | 96.03 % hit cod | 1.169 % hit the contaminant index; **0.057 %** contaminant only (1,277 pairs) | mouse 307, human 167, common frog 148 pairs (R1 of contaminant-only pairs) | 2.5 s host + 39 s contaminant | 1.2 / 37.8 GB |
+| sylph query | ANI 99.50 %, 0.61× | no other genome detected | — | 3.8 s sketch + 5.4 s query | 1.0 GB |
+
+For reference, bycatch reports 0.053 % non-cod (mouse 0.024 %, frog 0.009 %), and Kraken2
+1.45 % at confidence 0 and 0.020 % at 0.1.
+
+- deacon: 24,707 pairs (1.11 %) hit both cod and the contaminant index. Counted as
+  contamination, they put deacon at Kraken2 c 0's level. Without them, deacon lands at
+  bycatch's level, with the same top organisms. 86,985 pairs (3.91 %) hit neither index.
+- sylph at default settings reports only cod. A trace of 0.05 % of a 2.7 Gb genome is far
+  below the coverage sylph needs.
+
+### Reading the Rust results
+
+- **deacon** is the fastest to scan once its index is loaded: cod on lane A in 2.5 s. But it
+  is a host filter. A per-organism report needs one index per organism, and composing
+  indexes is slow (37 min, 54 GB for 23 genomes). Its 2-hit rule is like bycatch's. It has no
+  90 % rule, so pairs with hits to both cod and a contaminant need a choice from the user.
+- **Kun-peng** is more accurate than Kraken2 on short10 (11 wrong calls against 510), and its
+  index is about the size of Kraken2's. Its build needs several times the database size in
+  temporary disk. Its loss of long reads from small genomes at confidence 0.1 is unexplained.
+- **sylph** is the smallest and needs no per-read work, but at the coverage of these sets it
+  misses traces that bycatch, deacon and Kraken2 all see.
 
 ## Per-read k-mer classifiers
 
@@ -202,5 +302,5 @@ The figures for the published tools are approximate. They come from memory of th
 cited above, which were not opened or checked for this document. The figures for bycatch
 come from [README.md](README.md) and [PERFORMANCE.md](PERFORMANCE.md).
 
-Kraken2 and sourmash were measured on bycatch's data (see "Measured head-to-head"). The
-other tools were not.
+Kraken2, sourmash, deacon, Kun-peng and sylph were measured on bycatch's data (see the two
+"Measured head-to-head" sections). The other tools were not.
