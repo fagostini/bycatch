@@ -21,6 +21,44 @@ On 2026-11-24 all six tools were run again in a pre-registered benchmark on one 
 cod-host panel, with synthetic reads of known composition from non-indexed assemblies (see
 "Fair benchmark"). Its accuracy numbers replace those of the two older sections.
 
+## Tools at a glance
+
+The tools compared in this document, described by design and documented features. Measured
+speed, resources and accuracy are in "Fair benchmark" below. They are not used here.
+
+### Strengths and weaknesses
+
+| Tool | What it does | Strengths | Weaknesses |
+|---|---|---|---|
+| **bycatch** | Assigns each read or pair to one of the organisms in a fixed panel, without a taxonomy, and reports the share of each. | Exact canonical-minimizer matches, so no hash collisions. Explicit `shared` category instead of a tree. Categories for adapters, low-complexity reads and unmatched reads. `--every N` sampling and `--precision` early stop. Confidence intervals corrected for duplicates, plus an EM estimate. Run-level QC across samples (background, elevated samples, index hopping). MultiQC output. Memory-mapped index shared by concurrent scans. Genomes can be added to an index without a rebuild. | No hierarchy: reads shared between organisms are not placed on a genus or family. Exact matching misses strains that differ from the reference. At most 255 organisms, and the index must fit in RAM. No filtered-FASTQ output. A new tool with a small user base. |
+| **Kraken2** | Assigns reads to taxa by lowest common ancestor (LCA) on hashed minimizers, using the NCBI or a custom taxonomy. | The established standard, with a large user base and many prebuilt databases. LCA places shared reads at genus or family level. A `--confidence` threshold. Bracken re-estimates abundance from its output. | Needs a taxonomy to build. The compact hash table allows a small rate of collisions. The whole database is loaded into RAM, or memory-mapped. No sampling, intervals or run-level view. |
+| **Kun-peng** | Kraken2-style LCA classifier, with a database split into chunks on disk. | Kraken2-compatible output and confidence threshold. Built for databases larger than RAM: chunks are loaded in turn. | Needs a taxonomy. A build writes large temporary files. Requires at least 3 threads. A young project. No sampling, intervals or run-level view. |
+| **deacon** | Minimizer filter: a read either matches the index or not, and is kept or removed. | Writes host-depleted FASTQ/FASTA, compressed, and streams from stdin and to stdout. Absolute (`-a`) and relative (`-r`) match thresholds. Index set operations (`union`, `diff`). Designed for host depletion, with a prebuilt human pangenome index. | Does not name organisms. Separating host, contaminant and unknown takes two indexes and two passes. No abundance report beyond a JSON summary. |
+| **sylph** | Sample-level profiler: containment ANI and abundance from FracMinHash sketches. | Very small databases. Scales to many thousands of genomes. Reports ANI and effective coverage. Statistical correction for low coverage. | No read-level output. Sketching samples only part of the k-mers, so it has a detection floor at low coverage. Abundance is relative to the genomes detected. |
+| **sourmash** | Sample-level containment of FracMinHash sketches (`gather`). | Very small sketches. Mature, well documented, with a broad set of commands. Works with large public sketch collections. | No read-level output. Results are shares of k-mers, not reads. A minimum-overlap threshold (`--threshold-bp`) sets the detection floor. |
+
+Hyper-Gen was considered and left out. It sketches whole genomes to estimate
+genome-to-genome ANI, like Mash or skani, and has no read classification or containment
+mode.
+
+### Gaps in existing tools, and what bycatch does about them
+
+| Gap | Tools that have it | bycatch | How |
+|---|---|---|---|
+| Must read every read before giving an answer | Kraken2, Kun-peng, deacon | Addressed | `--every N` samples across the whole file. `--precision` stops once the interval is narrow enough. |
+| No uncertainty on the contamination figure | Kraken2, Kun-peng, deacon, sourmash | Addressed | 95 % Wilson intervals, corrected for PCR and optical duplicates. sylph reports ANI intervals, not abundance intervals. |
+| Each sample judged alone | all | Addressed | `bycatch run`: one matrix per run, with background, elevated-sample and index-hopping flags. |
+| Unexplained reads land in one "unclassified" bucket | Kraken2, Kun-peng, deacon | Addressed | Separate `shared`, `adapter`, `low_complexity`, `weak`, `conflict` and `unmatched` categories, plus `--unmatched-out` for follow-up with BLAST. |
+| A taxonomy is needed to build | Kraken2, Kun-peng | Addressed | A plain list of genomes. Shared k-mers are tagged, not placed on a tree. |
+| Adding a genome means a full rebuild | Kraken2, Kun-peng | Addressed | `bycatch add` merges new genomes into an existing index. |
+| No organism names | deacon | Addressed | Each read gets one panel organism. |
+| No read-level output | sylph, sourmash | Addressed | `--reads` writes one line per classified read. |
+| Reads shared within a genus are lost | bycatch | Not addressed | Kraken2 and Kun-peng place them by LCA. bycatch counts them as `shared`. |
+| Strains or species that differ from the reference | bycatch, deacon, Kraken2, Kun-peng | Not addressed | All rely on exact k-mer matches. Approximate methods (Centrifuger, Metabuli, alignment) tolerate divergence. |
+| More than 255 organisms, or an index larger than RAM | bycatch | Not addressed | sylph and Kun-peng scale further. |
+| Host-depleted FASTQ output | bycatch, sylph, sourmash; Kraken2 and Kun-peng only via KrakenTools | Not addressed | deacon writes it directly. bycatch writes only a sample of `unmatched` reads. |
+| Close relatives of a panel organism that are not in the panel | all | Not addressed | No reference, so every tool calls them the nearest panel organism, or nothing. |
+
 ## Fair benchmark: cod-host panel (2026-11-24)
 
 This section replaces the two older head-to-head sections for accuracy. Those sections
