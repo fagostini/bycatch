@@ -207,12 +207,31 @@ fn read_fragments(
     Ok((n, stopped))
 }
 
-/// The strict rule: the top organism has at least 2 marker hits, at least 90 % of all
-/// marker hits, and at least `min_frac` of the fragment's minimizers. The last test
-/// scales with read length: a long host read can pick up 2 stray markers of another
-/// organism and none of its own.
-fn assigned(best: u32, total: u32, minimizers: usize, min_frac: f64) -> bool {
-    best >= 2 && best * 10 >= total * 9 && best as f64 >= min_frac * minimizers as f64
+/// The strict rule. The top organism is assigned when it has at least 2 marker hits,
+/// at least `min_frac` of the fragment's minimizers, and with its group's markers at
+/// least 90 % of all marker hits. The `min_frac` test scales with read length: a long
+/// host read can pick up 2 stray markers of another organism and none of its own.
+/// Otherwise a group is assigned when its markers and its members' pass the same tests.
+/// Returns the organism or group id and the hits that support it.
+fn call(hits: &[(usize, u32, u32)], genomes: usize, group_of: &[Option<usize>], minimizers: usize, min_frac: f64) -> Option<(usize, u32)> {
+    let total: u32 = hits.iter().map(|h| h.1).sum();
+    let ok = |own: u32, support: u32| own >= 2 && support * 10 >= total * 9 && own as f64 >= min_frac * minimizers as f64;
+    let count = |g: usize| hits.iter().find(|h| h.0 == g).map_or(0, |h| h.1);
+    if let Some(&(g, own, _)) = hits.iter().filter(|h| h.0 < genomes).max_by_key(|h| h.1) {
+        let support = own + group_of[g].map_or(0, count);
+        if ok(own, support) {
+            return Some((g, support));
+        }
+    }
+    let in_group = |id: usize, gr: usize| id == gr || id < genomes && group_of[id] == Some(gr);
+    let mut best: Option<(usize, u32)> = None;
+    for gr in hits.iter().filter_map(|h| if h.0 < genomes { group_of[h.0] } else { Some(h.0) }) {
+        let sum = hits.iter().filter(|h| in_group(h.0, gr)).map(|h| h.1).sum();
+        if best.is_none_or(|b| sum > b.1) {
+            best = Some((gr, sum));
+        }
+    }
+    best.filter(|&(_, sum)| ok(sum, sum))
 }
 
 /// Index hits of one fragment.
@@ -399,6 +418,8 @@ const MIN_FOR_PRECISION: u64 = 10_000;
 /// Counts of one scanned sample.
 pub struct Report {
     pub host: Option<usize>,
+    /// the host's group: "host or a close relative", not contamination
+    pub host_group: Option<usize>,
     pub reads: Vec<u64>,    // fragments assigned per organism
     pub hits: Vec<u64>,     // marker k-mer hits per organism
     pub distinct: Vec<u64>, // different markers hit per organism
@@ -422,13 +443,18 @@ impl Report {
         wilson(x as f64 / self.sampled.max(1) as f64, self.sampled as f64 / self.design)
     }
 
+    /// Whether fragments of organism or group `g` count as host.
+    pub fn is_host(&self, g: usize) -> bool {
+        self.host == Some(g) || self.host_group == Some(g)
+    }
+
     /// Non-host fragments assigned by the strict rule (needs a host).
     pub fn contamination(&self) -> Option<u64> {
-        self.host.map(|h| self.reads.iter().sum::<u64>() - self.reads[h])
+        self.host.map(|_| (0..self.reads.len()).filter(|&g| !self.is_host(g)).map(|g| self.reads[g]).sum())
     }
 
     pub fn em_contamination(&self) -> Option<f64> {
-        self.host.map(|h| self.est.iter().sum::<f64>() - self.est[h])
+        self.host.map(|_| (0..self.est.len()).filter(|&g| !self.is_host(g)).map(|g| self.est[g]).sum())
     }
 
     pub fn write_tsv(&self, idx: &Index, out: &mut impl Write) -> Res<()> {
@@ -445,6 +471,9 @@ impl Report {
             let mut note = Vec::new();
             if self.host == Some(g) {
                 note.push("host");
+            }
+            if g >= idx.genomes {
+                note.push(if self.host_group == Some(g) { "group,host_group" } else { "group" });
             }
             if self.hits[g] >= MIN_HITS_FOR_FLAG && div.is_some_and(|d| d < LOW_DIVERSITY) {
                 note.push("low_diversity");
@@ -486,10 +515,10 @@ impl Report {
 pub fn host_id(idx: &Index, host: Option<&str>) -> Res<Option<usize>> {
     match host {
         Some(h) => Ok(Some(
-            idx.names
+            idx.names[..idx.genomes]
                 .iter()
                 .position(|n| n == h)
-                .ok_or_else(|| format!("host '{h}' is not in the index: {:?}", idx.names))?,
+                .ok_or_else(|| format!("host '{h}' is not an organism in the index: {:?}", &idx.names[..idx.genomes]))?,
         )),
         None => Ok(None),
     }
@@ -545,6 +574,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     if opts.precision.is_some() && host.is_none() {
         return Err("--precision needs --host: it is the precision of the contamination percent".into());
     }
+    let host_group = host.and_then(|h| idx.group_of[h]);
     let mut dump = match &opts.reads_out {
         Some(p) => {
             let f = std::fs::File::create(p).map_err(|e| format!("{p}: {e}"))?;
@@ -591,16 +621,19 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 hits[g] += h as u64;
                 distinct[g] += d as u64;
             }
-            let category = match c.hits.iter().max_by_key(|h| h.1) {
-                Some(&(g, best, _)) if assigned(best, total, c.minimizers, opts.min_frac) => {
+            let decision = call(&c.hits, idx.genomes, &idx.group_of, c.minimizers, opts.min_frac);
+            let category = match decision {
+                Some((g, support)) => {
                     reads[g] += 1;
                     assigned_hits += total as u64;
-                    off_target += (total - best) as u64;
+                    off_target += (total - support) as u64;
                     idx.names[g].as_str()
                 }
-                Some(_) => {
-                    // single hits are dropped: on real lanes they inflated trace organisms ~10x
-                    let pattern: Vec<(usize, u32)> = c.hits.iter().filter(|h| h.1 >= 2).map(|h| (h.0, h.1)).collect();
+                None if !c.hits.is_empty() => {
+                    // single hits are dropped: on real lanes they inflated trace organisms ~10x.
+                    // EM splits among organisms only: group markers say too little.
+                    let pattern: Vec<(usize, u32)> =
+                        c.hits.iter().filter(|h| h.1 >= 2 && h.0 < idx.genomes).map(|h| (h.0, h.1)).collect();
                     if !pattern.is_empty() {
                         *ambiguous.entry(pattern).or_default() += 1;
                     }
@@ -640,7 +673,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
             }
         }
         if let (Some(p), Some(h)) = (opts.precision, host) {
-            let contam = reads.iter().sum::<u64>() - reads[h];
+            let contam: u64 = (0..n_org).filter(|&g| g != h && Some(g) != host_group).map(|g| reads[g]).sum();
             let (lo, hi) = wilson(contam as f64 / sampled as f64, sampled as f64 / dups.design_effect());
             if sampled >= MIN_FOR_PRECISION && (hi - lo) / 2.0 <= p {
                 precision_stop = true;
@@ -668,6 +701,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     };
     Ok(Report {
         host,
+        host_group,
         reads,
         hits,
         distinct,
@@ -738,11 +772,28 @@ mod tests {
 
     #[test]
     fn min_frac_scales_with_minimizers() {
-        use super::assigned;
-        assert!(assigned(2, 2, 40, 0.0));
-        assert!(!assigned(2, 2, 40, 0.1), "2 of 40 minimizers is below 10 %");
-        assert!(assigned(4, 4, 40, 0.1));
-        assert!(!assigned(1, 1, 5, 0.0) && !assigned(8, 10, 40, 0.0), "2-hit and 90 % rules still apply");
+        use super::call;
+        let one = |best: u32, total: u32, minz: usize, f: f64| {
+            let hits = if best == total { vec![(0, best, 0)] } else { vec![(0, best, 0), (1, total - best, 0)] };
+            call(&hits, 2, &[None, None], minz, f).is_some()
+        };
+        assert!(one(2, 2, 40, 0.0));
+        assert!(!one(2, 2, 40, 0.1), "2 of 40 minimizers is below 10 %");
+        assert!(one(4, 4, 40, 0.1));
+        assert!(!one(1, 1, 5, 0.0) && !one(8, 10, 40, 0.0), "2-hit and 90 % rules still apply");
+    }
+
+    #[test]
+    fn groups_take_reads_their_members_share() {
+        use super::call;
+        // organisms 0 and 1 in group 3, organism 2 alone
+        let group_of = [Some(3), Some(3), None];
+        let c = |hits: &[(usize, u32, u32)]| call(hits, 3, &group_of, 20, 0.0);
+        assert_eq!(c(&[(0, 5, 0), (3, 10, 0)]), Some((0, 15)), "group markers back their member");
+        assert_eq!(c(&[(0, 3, 0), (1, 3, 0), (3, 10, 0)]), Some((3, 16)), "both members: the group");
+        assert_eq!(c(&[(3, 6, 0)]), Some((3, 6)), "group markers only");
+        assert_eq!(c(&[(2, 6, 0), (3, 6, 0)]), None, "group against an outsider: conflict");
+        assert_eq!(c(&[(3, 1, 0)]), None, "one hit is too little");
     }
 
     #[test]

@@ -78,7 +78,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 pub fn flags(samples: &[Sample], reports: &[&Report], n_org: usize, host: Option<usize>) -> Vec<Flag> {
     let mut rows = Vec::new();
     let n = reports.len();
-    for g in (0..n_org).filter(|&g| Some(g) != host) {
+    // the host's group is host or a close relative, not contamination
+    for g in (0..n_org).filter(|&g| Some(g) != host && !reports.iter().any(|r| r.host_group == Some(g))) {
         let pct: Vec<f64> = reports.iter().map(|r| r.pct(r.reads[g] as f64)).collect();
         let med = median(pct.clone());
         let detected = reports.iter().filter(|r| r.reads[g] >= MIN_READS).count();
@@ -174,11 +175,16 @@ fn write_bars(w: &mut impl Write, rows: &[(String, &Report)], cats: &[(Column, &
 /// own colour; the rest are summed as one "other" column.
 pub fn write_mqc(prefix: &str, idx: &Index, rows: &[(String, &Report)]) -> Res<()> {
     let host = rows.first().and_then(|r| r.1.host);
+    let host_group = rows.first().and_then(|r| r.1.host_group);
     let organism = |g: usize, name: String| -> Column { (idx.names[g].clone(), name, rows.iter().map(|r| r.1.reads[g]).collect()) };
+    let label = |g: usize| match g {
+        _ if Some(g) == host => format!("{} (host)", idx.names[g]),
+        _ if Some(g) == host_group => format!("{} (host group)", idx.names[g]),
+        _ if g >= idx.genomes => format!("{} (group)", idx.names[g]),
+        _ => idx.names[g].clone(),
+    };
 
-    let mut all: Vec<Column> = (0..idx.names.len())
-        .map(|g| organism(g, if Some(g) == host { format!("{} (host)", idx.names[g]) } else { idx.names[g].clone() }))
-        .collect();
+    let mut all: Vec<Column> = (0..idx.names.len()).map(|g| organism(g, label(g))).collect();
     all.extend(SPECIAL.iter().enumerate().map(|(c, &n)| (n.to_string(), n.to_string(), rows.iter().map(|r| r.1.special[c]).collect())));
     let cats = top_columns(rows, all, "other");
     let mut w = create(&format!("{prefix}_bycatch_mqc.tsv"))?;
@@ -200,7 +206,7 @@ pub fn write_mqc(prefix: &str, idx: &Index, rows: &[(String, &Report)]) -> Res<(
 
     // MultiQC orders custom sections by id: bycatch, bycatch_contaminants, bycatch_flags
     let contaminants: Vec<Column> =
-        (0..idx.names.len()).filter(|&g| Some(g) != host).map(|g| organism(g, idx.names[g].clone())).collect();
+        (0..idx.names.len()).filter(|&g| Some(g) != host && Some(g) != host_group).map(|g| organism(g, label(g))).collect();
     let cats = top_columns(rows, contaminants, "other organisms");
     let mut w = create(&format!("{prefix}_bycatch_contaminants_mqc.tsv"))?;
     writeln!(w, "# id: 'bycatch_contaminants'")?;
@@ -410,6 +416,7 @@ mod tests {
         let n = reads.len();
         Report {
             host: Some(0),
+            host_group: None,
             est: reads.iter().map(|&x| x as f64).collect(),
             reads,
             hits: vec![0; n],

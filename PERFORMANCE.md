@@ -116,7 +116,8 @@ Fraction of human reads classified, by read length (w = 15):
 5. **Close relatives cancel each other.** A k-mer present in two genomes becomes `shared` and
    counts for neither. Two strains of one species, or two species of one genus, lose most of
    their markers. `build` warns when an organism keeps less than 50 % unique markers.
-   Group such genomes under one name instead.
+   Put such genomes in one group (third column of the genome list): what they share then
+   counts for the group, and what is unique still counts for each genome.
 6. **Exact 27-mer matching needs close sequence identity.** A contaminant that is a different
    strain or species from the reference (more than a few % divergent) gives fewer hits and may
    end up as `weak` or `unmatched`. High-error long reads (ONT, ~5–10 %) also lose k-mers, but

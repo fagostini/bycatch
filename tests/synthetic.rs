@@ -229,6 +229,61 @@ fn reads_fq(reads: &[Vec<u8>]) -> String {
     fq
 }
 
+/// Two organisms of one group share a block: reads from it go to the group, not to
+/// `shared`, and, with one of them as host, the group is not contamination. `add`
+/// gives the same index as a single build.
+#[test]
+fn groups() {
+    let dir = std::env::temp_dir().join(format!("bycatch_groups_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    let block = rng.seq(3000);
+    let (mut a, mut b, c) = (rng.seq(100_000), rng.seq(100_000), rng.seq(100_000));
+    a[1000..4000].copy_from_slice(&block);
+    b[5000..8000].copy_from_slice(&block);
+    let mut reads = Vec::new();
+    for (g, n) in [(&a, 800), (&c, 100)] {
+        for _ in 0..n {
+            let s = rng.next() as usize % (g.len() - 100);
+            reads.push(g[s..s + 100].to_vec());
+        }
+    }
+    for _ in 0..100 {
+        let s = rng.next() as usize % (block.len() - 100);
+        reads.push(block[s..s + 100].to_vec());
+    }
+    std::fs::write(p("reads.fq"), reads_fq(&reads)).unwrap();
+
+    let scan = |idx: &str| run(&["scan", "-i", &p(idx), "--host", "a", "--every", "1", &p("reads.fq")]);
+    std::fs::write(p("plain.tsv"), write_genomes(&dir, &[("a", &a, None), ("b", &b, None), ("c", &c, None)])).unwrap();
+    run(&["build", &p("plain.tsv"), "--out", &p("plain")]);
+    let plain = parse(&scan("plain"));
+    assert!(plain["shared"] >= 95.0, "block reads are shared without groups: {plain:?}");
+
+    let grouped = write_genomes(&dir, &[("a", &a, Some("ab")), ("b", &b, Some("ab")), ("c", &c, None)]);
+    std::fs::write(p("grouped.tsv"), &grouped).unwrap();
+    run(&["build", &p("grouped.tsv"), "--out", &p("grouped")]);
+    let report = scan("grouped");
+    let r = parse(&report);
+    assert!(r["ab"] >= 95.0 && r["shared"] <= 5.0, "block reads go to the group: {r:?}");
+    // a's reads that fall wholly inside the block (~3 % of a) also go to the group
+    assert!(r["a"] + r["ab"] >= 895.0 && r["a"] >= 760.0 && r["c"] >= 99.0, "{r:?}");
+    assert!(report.lines().any(|l| l.starts_with("ab\t") && l.contains("group,host_group")), "{report}");
+    // contamination: c only, not the host's group
+    let contam: f64 = report.lines().find(|l| l.starts_with("# contamination_percent")).unwrap().split('\t').nth(1).unwrap().parse().unwrap();
+    assert!((contam - 100.0 * r["c"] / 1000.0).abs() < 1e-3, "{contam} {r:?}");
+
+    // add: a first, then b (same group) and c
+    let mut lines = grouped.lines();
+    std::fs::write(p("first.tsv"), format!("{}\n", lines.next().unwrap())).unwrap();
+    std::fs::write(p("rest.tsv"), lines.map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    run(&["build", &p("first.tsv"), "--out", &p("first")]);
+    run(&["add", "-i", &p("first"), &p("rest.tsv"), "--out", &p("added")]);
+    assert_eq!(scan("added"), report, "add gives the same index as one build");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Over 255 organisms the index switches to wider ids; `add` across the limit gives the
 /// same result as one build.
 #[test]

@@ -26,6 +26,12 @@ ecoli	data/ecoli.fa
 phix	data/phix.fa
 ```
 
+An optional third column puts organisms in a **group**, such as a genus:
+`cod<TAB>cod.fa.gz<TAB>Gadus`. A k-mer found only in genomes of one group then goes to
+that group instead of `shared`, and reads it explains get a group row in the report (see
+"Deciding the read's category"). No taxonomy is needed. Without a third column nothing
+changes, and the index is identical to one built before groups existed.
+
 Build the index (writes `idx.kmers`, `idx.table` and `idx.meta`):
 
 ```bash
@@ -325,7 +331,8 @@ For a sampled read (or pair):
 | no hit and no minimizer at all (poly-G, simple repeats, shorter than 27 bp) | `low_complexity` |
 | no hit otherwise | `unmatched` |
 | only `shared` hits | `shared` |
-| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits **and** hits at least `--min-frac` (default 15 %) of the fragment's minimizers | that organism |
+| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits **and** hits at least `--min-frac` (default 15 %) of the fragment's minimizers; its group's markers count with it toward the 90 % | that organism |
+| otherwise, a group's markers plus its members' pass the same three tests | that group |
 | markers of one organism only, but too few hits for the rule above | `weak` |
 | anything else (markers of several organisms) | `conflict` |
 
@@ -368,8 +375,10 @@ note `low_diversity`. Heavy PCR duplication can also cause it, so the note means
 
 ### 5. Report
 
-TSV on stdout. One row per organism, in index order, then `shared`, `weak`, `conflict`,
-`adapter`, `low_complexity` and `unmatched`.
+TSV on stdout. One row per organism, in index order, then one per group (note `group`),
+then `shared`, `weak`, `conflict`, `adapter`, `low_complexity` and `unmatched`. The host's
+group (note `group,host_group`) is "host or a close relative": it does not count as
+contamination. The EM estimate splits `weak` and `conflict` reads among organisms only.
 
 `adapter` looks for every 17-mer (not only minimizers) of reads with no other hit in a
 built-in list: Illumina TruSeq read 1 and 2 and the P5 side, Nextera read 1 and 2 and the
