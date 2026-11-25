@@ -231,9 +231,9 @@ pub fn add(old: &str, list: &str, out: &str, jobs: usize) -> Res<()> {
     let labels = Labels::new(&all).map_err(|e| format!("{list}: {e}"))?;
     // groups of the old index that no new genome names keep their name: add them in old order
     let mut labels = labels;
-    for x in idx.genomes..idx.names.len() {
-        if !labels.names[labels.genomes..].contains(&idx.names[x]) {
-            labels.names.push(idx.names[x].clone());
+    for name in &idx.names[idx.genomes..] {
+        if !labels.names[labels.genomes..].contains(name) {
+            labels.names.push(name.clone());
         }
     }
     let remap = old_ids(&idx, &labels);
