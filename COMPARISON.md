@@ -17,11 +17,259 @@ below). Three tools written in Rust, deacon, Kun-peng and sylph, were run on the
 2026-11-23 (see "Measured head-to-head: Rust tools"). Bracken, centrifuger and mash are
 installed but not yet run.
 
+On 2026-11-24 all six tools were run again in a pre-registered benchmark on one shared
+cod-host panel, with synthetic reads of known composition from non-indexed assemblies (see
+"Fair benchmark"). Its accuracy numbers replace those of the two older sections.
+
+## Fair benchmark: cod-host panel (2026-11-24)
+
+This section replaces the two older head-to-head sections for accuracy. Those sections
+simulated reads from the indexed genomes (a best case) and scored a real lane without truth.
+
+The protocol was pre-registered in [bench/fair/PROTOCOL.md](bench/fair/PROTOCOL.md) and
+committed (761fd11) before any tool ran. The commit also froze the scorer, the
+output-to-category converters and the simulator. Count tables, timing files, summaries and
+scripts are in `data/bench/fair/` (git-ignored). [bench/fair/aggregate.py](bench/fair/aggregate.py)
+rebuilds the summaries from the count tables.
+
+**Panel**: one 10-genome set for every tool (`data/genomes_cod10.tsv`, ~7 Gb):
+
+- host: cod
+- in panel: human, mouse, *L. sinapis*, *Drosophila*, *Arabidopsis*, yeast, *M. tuberculosis*, *E. coli*, phiX
+
+**Reads**: ART HS25, paired, insert N(250, 80).
+
+- Inserts shorter than the read run into the adapter (TruSeq plus poly-G).
+- 2 % of reads get poly-G tails.
+- Reads come from other assemblies than the indexed ones:
+  - cod GCA_010882105.1
+  - human CHM13
+  - mouse CAST/EiJ
+  - *Drosophila* A4
+  - *Arabidopsis* Ler-0
+  - yeast YJM789
+  - Mtb CDC1551
+  - *E. coli* Sakai
+  - *L. sinapis* GCA_949711785.1
+  - phiX: the panel copy, a best case.
+- Off-panel spike-ins, in equal parts: Pacific cod, dog, common frog.
+
+**Sets**: 2×50, 2×100 and 2×150, each in three mixtures, each with 3 seeds (27 sets).
+
+| Mix | Pairs | Host | In panel | Off panel |
+|---|---|---|---|---|
+| low | 2 M | 99.9 % | 0.07 % | 0.03 % |
+| mid | 0.5 M | 99 % | 0.7 % | 0.3 % |
+| high | 0.5 M | 90 % | 7 % | 3 % |
+
+Seed 1 of the 2×150 mid set is used only to pick each tool's threshold. Every number below is
+the mean of seeds 2 and 3. A 10 M-pair 2×150 mid set is used only for timing.
+
+**Tools**, each on its documented defaults plus one pre-registered threshold sweep:
+
+| Tool | Sweep | Pick rule (seed 1) | Picked | Default |
+|---|---|---|---|---|
+| bycatch 4b937e8 | none | - | - | - |
+| Kraken2 2.17.2, NCBI taxonomy | `--confidence` 0–0.5 | macro F1 | 0.2 | 0 |
+| Kun-peng 0.7.5, NCBI taxonomy | `-T` 0–0.5 | macro F1 | 0.2 | 0 |
+| deacon 0.20.0 (cod index + contaminant index) | `-a` 1–3 | contamination F1 | 3 | 2 |
+| sourmash 4.9.4 gather | `--threshold-bp` 50000, 10000, 2000 | in-panel error | 2000 | 50000 |
+| sylph 0.9.0 profile | none | - | - | - |
+
+- Kraken2 and Kun-peng were also built on a flat taxonomy. The scores are almost the same,
+  so only the NCBI rows are shown.
+- Rust tools were built with `-C target-cpu=native`.
+
+**Scoring**
+
+- Kraken2 and Kun-peng calls inside a panel subtree count as that organism.
+- A call on an ancestor counts as "higher", so genus *Gadus* is not cod.
+- bycatch `shared`, `adapter` and `low_complexity` count as unassigned.
+- deacon is scored only as host or contaminant, because it does not name organisms.
+- sylph and sourmash are scored only at sample level.
+
+### Host reads wrongly called contaminant (mid mix)
+
+The share of cod reads called something else. It sets the false contamination floor.
+
+| Tool | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| bycatch | 0.005 % | 0.022 % | 0.034 % |
+| Kraken2 c0.2 | 0.034 % | 0.009 % | 0.007 % |
+| Kraken2 c0 (default) | 0.13 % | 0.44 % | 0.64 % |
+| Kun-peng c0.2 | 0.024 % | 0.001 % | 0.0003 % |
+| Kun-peng c0 (default) | 0.43 % | 0.72 % | 0.86 % |
+| deacon a3 | 0.002 % | 0.009 % | 0.011 % |
+| deacon a2 (default) | 0.011 % | 0.020 % | 0.019 % |
+
+### Host reads left unassigned (mid mix)
+
+These reads are not called cod. This does not inflate contamination, but it lowers the
+host count.
+
+| Tool | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| bycatch | 19.5 % | 8.2 % | 7.4 % |
+| Kraken2 c0.2 | 17.0 % | 14.5 % | 14.7 % |
+| Kun-peng c0.2 | 13.6 % | 11.3 % | 11.9 % |
+| deacon a3 | 52.8 % | 7.2 % | 5.3 % |
+| deacon a2 (default) | 24.5 % | 5.7 % | 4.5 % |
+
+### Per-organism accuracy
+
+Macro F1 is the mean of per-read F1 over the 8 named in-panel organisms (cod and phiX
+excluded). Each cell is low mix / high mix.
+
+| Tool | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| bycatch | 0.87 / 0.91 | 0.88 / 0.97 | 0.85 / 0.97 |
+| Kraken2 c0.2 | 0.83 / 0.94 | 0.91 / 0.96 | 0.92 / 0.96 |
+| Kraken2 c0 (default) | 0.73 / 0.94 | 0.66 / 0.94 | 0.61 / 0.93 |
+| Kun-peng c0.2 | 0.85 / 0.93 | 0.94 / 0.96 | 0.94 / 0.95 |
+| Kun-peng c0 (default) | 0.69 / 0.93 | 0.68 / 0.92 | 0.66 / 0.91 |
+
+Contamination F1 scores each read as contaminant or not, so deacon can be compared too.
+Each cell is low mix / mid mix.
+
+| Tool | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| bycatch | 0.87 / 0.91 | 0.83 / 0.95 | 0.75 / 0.94 |
+| Kraken2 c0.2 | 0.74 / 0.92 | 0.89 / 0.95 | 0.90 / 0.96 |
+| Kun-peng c0.2 | 0.78 / 0.92 | 0.94 / 0.96 | 0.95 / 0.95 |
+| deacon a3 | 0.64 / 0.65 | 0.90 / 0.95 | 0.89 / 0.95 |
+| deacon a2 (default) | 0.78 / 0.85 | 0.82 / 0.94 | 0.80 / 0.94 |
+
+All four per-read tools detect all 8 organisms (≥ 10 pairs) in every mixture.
+
+phiX recall:
+- bycatch: 0.97–1.00
+- Kraken2: 0.99
+- Kun-peng: 0.73–0.83
+
+### Contamination estimate
+
+In-panel contamination estimate. Each cell is low mix (truth 0.07 %) / high mix (truth 7 %).
+
+| Tool | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| bycatch | 0.065 / 6.0 % | 0.088 / 6.7 % | 0.103 / 6.8 % |
+| Kraken2 c0.2 | 0.095 / 6.4 % | 0.075 / 6.6 % | 0.073 / 6.6 % |
+| Kraken2 c0 (default) | 0.19 / 6.6 % | 0.50 / 7.2 % | 0.71 / 7.5 % |
+| Kun-peng c0.2 | 0.084 / 6.2 % | 0.065 / 6.4 % | 0.063 / 6.3 % |
+| deacon a3 | 0.036 / 3.6 % | 0.073 / 6.5 % | 0.075 / 6.6 % |
+| sourmash th2000 | 0.165 / 6.1 % | 0.156 / 5.8 % | 0.169 / 5.8 % |
+| sourmash th50000 (default) | 0.095 / 5.4 % | 0.114 / 5.1 % | 0.123 / 5.1 % |
+| sylph profile | 0 / 2.5 % | timeout / 3.2 % | timeout / 5.6 % |
+
+- The sourmash estimate is a share of k-mers, not reads.
+- sylph's `Sequence_abundance` is normalised over the genomes it detects.
+- At the sourmash default, the mid mix (truth 0.7 %) reads 0 / 0.32 / 0.50 %. The default
+  finds 0–3 of 9 organisms at low and mid. th2000 finds all 9.
+- sylph finds 0 organisms at mid and 2.5–5 of 9 at high. The 2×100 and 2×150 low-mix
+  profiles did not finish within 30 min.
+
+### Off-panel reads (mid mix)
+
+| Tool | Called cod: 2×50 / 2×100 / 2×150 |
+|---|---|
+| bycatch | 21 / 31 / 32 % |
+| Kraken2 c0.2 | 25 / 28 / 28 % |
+| Kun-peng c0.2 | 25 / 28 / 27 % |
+| deacon a3 | 8 / 30 / 33 % |
+
+Pacific cod is one third of the off-panel reads. Every tool calls most Pacific cod reads
+cod, and nearly all dog and frog reads unassigned. Off-panel reads hardly ever go to a
+wrong panel organism: ≤ 0.7 % at the picked settings. Kun-peng at its default sends
+3–4 % of 2×50 off-panel reads to one.
+
+### Resources
+
+16 cores and 61 GB RAM, the same machine as PERFORMANCE.md. Index and reads were read into
+page cache before each run.
+
+Build:
+
+| Tool | Build wall | Peak RAM | Index on disk | Notes |
+|---|---|---|---|---|
+| bycatch | 1:47 | 5.9 GB | 3.2 GB | |
+| Kraken2 | 16:39 + 18:15 | 10.1 GB | 9.7 GB | library + build |
+| Kun-peng | 2:27 | 4.0 GB | 11.3 GB | 56.9 GB peak temp disk (flat build) |
+| deacon | 31:44 | 18.9 GB | 6.0 GB | mostly `index union` |
+| sylph | 0:16 | 1.7 GB | 0.23 GB | |
+| sourmash | 3:17 | | 0.04 GB | |
+
+Classify, 10 M pairs, 2×150 (median of 3 at 16 threads):
+
+| Tool | 16 threads | 4 threads | 1 thread | Peak RSS | Pairs/s at 16 threads |
+|---|---|---|---|---|---|
+| bycatch | 20.0 s | 29.4 s | 78.6 s | 3.2 GB | 500 k |
+| Kraken2 | 47.1 s | 49.0 s | 128.5 s | 9.7 GB | 212 k |
+| Kun-peng | 79.3 s | 136.0 s | 216.2 s (3 threads) | 10.7 GB | 126 k |
+| deacon, cod + contaminant passes | 8.8 + 14.8 s | 8.4 + 14.9 s | 19.5 + 27.0 s | 1.2 / 9.0 GB | 424 k |
+
+- Kraken2 `--memory-mapping`: 47.3 s.
+- deacon only splits host and contaminant. bycatch, Kraken2 and Kun-peng name organisms.
+- sylph and sourmash were timed only per set, not on the 10 M-pair set. On a 0.5 M-pair
+  2×150 set:
+  - sylph: sketch 0.9 s, `query` 2.9 s, `profile` 15:07. `profile` ran on one core despite
+    `-t 16`, and timed out at 30 min on 2 M pairs.
+  - sourmash: sketch 6.1 s + gather 13.1 s.
+
+### Reading the fair benchmark
+
+- **Thresholds matter more than tools.**
+  - At their defaults, Kraken2 and Kun-peng call 0.1–0.9 % of cod reads contaminant. That
+    is above the low mix's whole 0.07 % contamination.
+  - At confidence 0.2, both are as clean as bycatch or cleaner from 2×100 up.
+  - bycatch has no threshold, and its default sits near their tuned setting.
+- **bycatch is best at 2×50.** Its host false positive rate (0.005 %) and contamination F1
+  (0.87 low) are the best of all tools at 2×50.
+- **Kraken2 and Kun-peng (tuned) lead at 2×100 and 2×150 in the low mix.** Their F1 is
+  0.89–0.95 against bycatch's 0.75–0.83. bycatch's host false positive rate grows with read
+  length (0.005 → 0.034 %): longer reads carry more chances for a stray exact 27-mer.
+- **High mix: about even.** bycatch has the best macro F1 at 2×100 and 2×150 (0.97).
+- **bycatch is the fastest full classifier.** It is 2.4× faster than Kraken2 and 4× faster
+  than Kun-peng at 16 threads, with a third of the RAM and index size. deacon is as fast but
+  only splits host and contaminant.
+- **bycatch builds fastest but one.** Only sylph builds faster.
+- **Close relatives.** No tool tells Pacific cod from Atlantic cod. Kraken2 and Kun-peng
+  with the NCBI taxonomy did not move those reads to genus *Gadus*.
+- **The sketch profilers are not a fit at these levels.** At their defaults, sylph and
+  sourmash miss most contaminants below 1 %. sourmash th2000 detects them but
+  overestimates low levels about 2×.
+
+### Deviations from the protocol
+
+- **Kraken2:** bioconda build only. The repository has no 2.17.2 tag to build from source.
+- **Protocol location:** the protocol lives in `bench/fair/` (tracked), not `data/bench/fair/`.
+- **Scoring:** contamination F1 was added to the scorer before the freeze commit, not after.
+- **Kun-peng:** it asserts more than 2 threads, so its low-thread timing is at 3 threads, not 1.
+- **Kun-peng temp disk:** the NCBI build's peak temp disk was lost to a bug in the disk
+  poller. The flat build's figure (56.9 GB) is shown instead.
+- **sylph timeout:** `profile` ran with a 30 min timeout that is not in the protocol. All
+  2×100 and 2×150 low-mix profiles hit it and are missing.
+- **Timing schedule:** all timings are from 2026-11-24, the same day, but at different
+  hours:
+  - bycatch at 13:00
+  - Kraken2 at 14:00
+  - Kun-peng at 18:30
+  - deacon at 19:50
+  - sylph/sourmash per-set times from 20:00 to 02:40
+
+  The machine had no other heavy load.
+- **Cold-cache runs skipped:** they need `drop_caches`, which needs sudo.
+- **Output files:** bycatch reports and sylph outputs carry an appended timing line. The
+  scorer and `aggregate.py` skip it.
+- **deacon timing:** the timing runs write to `/dev/null`.
+
 ## Measured head-to-head: Kraken2 and sourmash (2026-11-21)
+
+Superseded for accuracy by "Fair benchmark" above: the reads here come from the indexed
+genomes, and the real lane has no truth.
 
 Same machine as PERFORMANCE.md (16 cores, 61 GB RAM). All three tools used the same genomes:
 the 10-genome set (`genomes10.tsv`, ~9 Gb) for the simulated reads, the 23-genome set
-(`genomes_all.tsv`, 31.4 Gb) for the real lane. Work files are in `/var/tmp/bench_cmp`.
+(`genomes_all.tsv`, 31.4 Gb) for the real lane. Work files were in `/var/tmp/bench_cmp` (deleted).
 
 - **bycatch**: current `main`, `--every 1`, `-t 16`.
 - **Kraken2 2.17.2** (bioconda): default k = 35, ℓ = 31 and masking, `--threads 16`.
@@ -118,9 +366,11 @@ unclassified at confidence 0, 11.55 % at 0.1.
 
 ## Measured head-to-head: Rust tools (2026-11-23)
 
+Superseded for accuracy by "Fair benchmark" above.
+
 The Rust tools closest to bycatch, run on the same machine, genomes and reads as above.
 bycatch, Kraken2 and sourmash were not run again: their rows are in the tables above, and
-were timed on 2026-11-21. Work files are in `/var/tmp/bench_rust`; scripts are in
+were timed on 2026-11-21. Work files were in `/var/tmp/bench_rust` (deleted); scripts are in
 `data/bench/rust_cmp/`.
 
 - **deacon 0.20.0** (cargo): a minimizer filter for host depletion, k = 31, w = 15. A read is
@@ -302,5 +552,5 @@ The figures for the published tools are approximate. They come from memory of th
 cited above, which were not opened or checked for this document. The figures for bycatch
 come from [README.md](README.md) and [PERFORMANCE.md](PERFORMANCE.md).
 
-Kraken2, sourmash, deacon, Kun-peng and sylph were measured on bycatch's data (see the two
-"Measured head-to-head" sections). The other tools were not.
+Kraken2, sourmash, deacon, Kun-peng and sylph were measured on bycatch's data (see "Fair
+benchmark" and the two "Measured head-to-head" sections). The other tools were not.
