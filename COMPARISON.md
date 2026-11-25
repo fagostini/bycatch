@@ -70,6 +70,7 @@ the mean of seeds 2 and 3. A 10 M-pair 2×150 mid set is used only for timing.
 | Tool | Sweep | Pick rule (seed 1) | Picked | Default |
 |---|---|---|---|---|
 | bycatch 4b937e8 | none | - | - | - |
+| bycatch `--min-frac` (post-hoc) | 0–0.3 | macro F1 | 0.15 | 0.15 since this study |
 | Kraken2 2.17.2, NCBI taxonomy | `--confidence` 0–0.5 | macro F1 | 0.2 | 0 |
 | Kun-peng 0.7.5, NCBI taxonomy | `-T` 0–0.5 | macro F1 | 0.2 | 0 |
 | deacon 0.20.0 (cod index + contaminant index) | `-a` 1–3 | contamination F1 | 3 | 2 |
@@ -95,6 +96,7 @@ The share of cod reads called something else. It sets the false contamination fl
 | Tool | 2×50 | 2×100 | 2×150 |
 |---|---|---|---|
 | bycatch | 0.005 % | 0.022 % | 0.034 % |
+| bycatch 0.15 (post-hoc) | 0.005 % | 0.013 % | 0.010 % |
 | Kraken2 c0.2 | 0.034 % | 0.009 % | 0.007 % |
 | Kraken2 c0 (default) | 0.13 % | 0.44 % | 0.64 % |
 | Kun-peng c0.2 | 0.024 % | 0.001 % | 0.0003 % |
@@ -110,6 +112,7 @@ host count.
 | Tool | 2×50 | 2×100 | 2×150 |
 |---|---|---|---|
 | bycatch | 19.5 % | 8.2 % | 7.4 % |
+| bycatch 0.15 (post-hoc) | 19.5 % | 8.8 % | 8.4 % |
 | Kraken2 c0.2 | 17.0 % | 14.5 % | 14.7 % |
 | Kun-peng c0.2 | 13.6 % | 11.3 % | 11.9 % |
 | deacon a3 | 52.8 % | 7.2 % | 5.3 % |
@@ -123,6 +126,7 @@ excluded). Each cell is low mix / high mix.
 | Tool | 2×50 | 2×100 | 2×150 |
 |---|---|---|---|
 | bycatch | 0.87 / 0.91 | 0.88 / 0.97 | 0.85 / 0.97 |
+| bycatch 0.15 (post-hoc) | 0.87 / 0.91 | 0.90 / 0.96 | 0.91 / 0.97 |
 | Kraken2 c0.2 | 0.83 / 0.94 | 0.91 / 0.96 | 0.92 / 0.96 |
 | Kraken2 c0 (default) | 0.73 / 0.94 | 0.66 / 0.94 | 0.61 / 0.93 |
 | Kun-peng c0.2 | 0.85 / 0.93 | 0.94 / 0.96 | 0.94 / 0.95 |
@@ -134,6 +138,7 @@ Each cell is low mix / mid mix.
 | Tool | 2×50 | 2×100 | 2×150 |
 |---|---|---|---|
 | bycatch | 0.87 / 0.91 | 0.83 / 0.95 | 0.75 / 0.94 |
+| bycatch 0.15 (post-hoc) | 0.87 / 0.91 | 0.87 / 0.95 | 0.89 / 0.96 |
 | Kraken2 c0.2 | 0.74 / 0.92 | 0.89 / 0.95 | 0.90 / 0.96 |
 | Kun-peng c0.2 | 0.78 / 0.92 | 0.94 / 0.96 | 0.95 / 0.95 |
 | deacon a3 | 0.64 / 0.65 | 0.90 / 0.95 | 0.89 / 0.95 |
@@ -153,6 +158,7 @@ In-panel contamination estimate. Each cell is low mix (truth 0.07 %) / high mix 
 | Tool | 2×50 | 2×100 | 2×150 |
 |---|---|---|---|
 | bycatch | 0.065 / 6.0 % | 0.088 / 6.7 % | 0.103 / 6.8 % |
+| bycatch 0.15 (post-hoc) | 0.065 / 6.0 % | 0.080 / 6.7 % | 0.077 / 6.7 % |
 | Kraken2 c0.2 | 0.095 / 6.4 % | 0.075 / 6.6 % | 0.073 / 6.6 % |
 | Kraken2 c0 (default) | 0.19 / 6.6 % | 0.50 / 7.2 % | 0.71 / 7.5 % |
 | Kun-peng c0.2 | 0.084 / 6.2 % | 0.065 / 6.4 % | 0.063 / 6.3 % |
@@ -173,14 +179,17 @@ In-panel contamination estimate. Each cell is low mix (truth 0.07 %) / high mix 
 | Tool | Called cod: 2×50 / 2×100 / 2×150 |
 |---|---|
 | bycatch | 21 / 31 / 32 % |
+| bycatch 0.15 (post-hoc) | 21 / 30 / 30 % |
 | Kraken2 c0.2 | 25 / 28 / 28 % |
 | Kun-peng c0.2 | 25 / 28 / 27 % |
 | deacon a3 | 8 / 30 / 33 % |
 
 Pacific cod is one third of the off-panel reads. Every tool calls most Pacific cod reads
 cod, and nearly all dog and frog reads unassigned. Off-panel reads hardly ever go to a
-wrong panel organism: ≤ 0.7 % at the picked settings. Kun-peng at its default sends
-3–4 % of 2×50 off-panel reads to one.
+wrong panel organism, but not never:
+- bycatch: 1.1–2.0 % at 2×100 and 2×150 (0.3 % at 2×50); 0.3–0.8 % at `--min-frac 0.15`.
+- Kraken2 c0.2: 0.3–1.2 %.
+- Kun-peng c0.2: 0.1–0.7 %. At its default it sends 3–4 % of 2×50 off-panel reads to one.
 
 ### Resources
 
@@ -209,6 +218,7 @@ Classify, 10 M pairs, 2×150 (median of 3 at 16 threads):
 
 - Kraken2 `--memory-mapping`: 47.3 s.
 - deacon only splits host and contaminant. bycatch, Kraken2 and Kun-peng name organisms.
+- `--min-frac` adds one comparison per read and did not change bycatch's speed (see Post-hoc).
 - sylph and sourmash were timed only per set, not on the 10 M-pair set. On a 0.5 M-pair
   2×150 set:
   - sylph: sketch 0.9 s, `query` 2.9 s, `profile` 15:07. `profile` ran on one core despite
@@ -221,7 +231,10 @@ Classify, 10 M pairs, 2×150 (median of 3 at 16 threads):
   - At their defaults, Kraken2 and Kun-peng call 0.1–0.9 % of cod reads contaminant. That
     is above the low mix's whole 0.07 % contamination.
   - At confidence 0.2, both are as clean as bycatch or cleaner from 2×100 up.
-  - bycatch has no threshold, and its default sits near their tuned setting.
+  - bycatch had no threshold, and its default sat near their tuned setting.
+  - With `--min-frac 0.15` (post-hoc, now the default), bycatch comes close to tuned Kraken2
+    and Kun-peng at 2×100 and 2×150 in the low mix: contamination F1 0.87–0.89 against
+    0.89–0.95, and host false positives 0.010–0.013 % against 0.0003–0.009 %.
 - **bycatch is best at 2×50.** Its host false positive rate (0.005 %) and contamination F1
   (0.87 low) are the best of all tools at 2×50.
 - **Kraken2 and Kun-peng (tuned) lead at 2×100 and 2×150 in the low mix.** Their F1 is
@@ -261,6 +274,70 @@ Classify, 10 M pairs, 2×150 (median of 3 at 16 threads):
 - **Output files:** bycatch reports and sylph outputs carry an appended timing line. The
   scorer and `aggregate.py` skip it.
 - **deacon timing:** the timing runs write to `/dev/null`.
+
+### Post-hoc: bycatch `--min-frac` (2026-11-25)
+
+**Not part of the pre-registered run above.** The pre-registered numbers stay as they are.
+The rows marked "bycatch 0.15 (post-hoc)" in the tables above come from this study.
+
+bycatch's host false positive rate grew with read length. A study then added one option
+to bycatch and tested it on new reads.
+
+**Diagnosis.** Per-read output on the seed-1 sets showed what the false calls looked like.
+At 2×100 and 2×150, cod reads called contaminant had:
+- 2 marker hits, against ~20 minimizers;
+- no cod hit;
+- a median share of minimizers hit of 0.11–0.18.
+
+True contaminant calls had a median share of 0.83–0.88. Only 1–2 % of them fell below 0.2.
+At 2×50 the two groups do not separate (a share of 0.29–1.0 for both), but false calls are
+already rare there.
+
+**Change.**
+- `--min-frac F`: the top organism must also hit at least F of the fragment's minimizers.
+  This is the same idea as Kraken2's `--confidence`.
+- Reads that fail go to `weak` or `conflict`.
+- `--min-frac 0` gives byte-identical output to the frozen build. This was checked on one
+  set. After this study the default was set to the pick, 0.15.
+
+**Protocol, the same as for Kraken2.**
+- Sweep 0, 0.05, 0.1, 0.15, 0.2 and 0.3 on 2×150 mid, seed 1. Pick by macro F1, ties going
+  to 0. **Picked: 0.15.**
+- Report on new seeds 4 and 5, simulated with the same scripts.
+- Run Kraken2 2.17.2 (NCBI taxonomy, c0 and c0.2) on the same seeds 4 and 5.
+
+Seeds 4–5 means:
+
+| Mix, reads | Metric | bycatch f0 | bycatch f0.15 | Kraken2 c0.2 |
+|---|---|---|---|---|
+| low, 2×150 | host false positives | 0.035 % | 0.011 % | 0.008 % |
+| | contamination F1 | 0.75 | 0.88 | 0.90 |
+| | macro F1 | 0.86 | 0.91 | 0.91 |
+| | in-panel estimate (truth 0.07 %) | 0.102 % | 0.077 % | 0.073 % |
+| low, 2×100 | host false positives | 0.023 % | 0.014 % | 0.008 % |
+| | contamination F1 | 0.82 | 0.87 | 0.90 |
+| mid, 2×150 | contamination F1 | 0.95 | 0.96 | 0.96 |
+| high, 2×150 | macro F1 | 0.967 | 0.967 | 0.958 |
+| any, 2×50 | all metrics | unchanged | unchanged | |
+| any | host reads left unassigned, 2×150 | 7.4 % | 8.4 % | 14.7 % |
+
+- At 0.2, the 2×150 low-mix contamination F1 reaches 0.91 and host false positives fall to
+  0.007 %. The macro F1 at the high mix drops 0.004. 0.2 was not the pick.
+- Speed: 10 M pairs at 16 threads took 20.6–27.6 s per run for every setting, including the
+  frozen build. The machine was noisier than on 2026-11-24, but there is no systematic cost.
+  Peak memory stayed at 3.2 GB.
+- With `--min-frac 0.15`, the low-mix gap to tuned Kraken2 at 2×100 and 2×150 mostly
+  closes. bycatch keeps its lead in the 2×50 low mix (contamination F1 0.88 against 0.73)
+  and in the 2×100 and 2×150 high mix. Kraken2 c0.2 stays ahead in the 2×50 mid and high
+  mixes (macro F1 0.92 / 0.94 against 0.90 / 0.91).
+- **Seeds 2–3 rows in the tables above.** The seed 2–3 sets were rebuilt from the same seeded
+  scripts. bycatch at `--min-frac 0` gave count tables byte-identical to the pre-registered
+  ones on all 18 sets, so the reads are the same, and so is the rebuilt seed 1 used for the
+  pick. bycatch at 0.15 was then run on them.
+- Unlike Kraken2's `--confidence`, this option was added after the seed 2–3 results were
+  seen. That is why it is marked post-hoc and was first checked on seeds 4–5.
+- Data: `data/bench/fair2/` (count tables, results, scripts; seeds 2–3 counts in
+  `counts/bycatch_mf_s23/`).
 
 ## Measured head-to-head: Kraken2 and sourmash (2026-11-21)
 

@@ -96,6 +96,9 @@ struct Common {
     /// Stop once the contamination 95 % CI is within ± this many percentage points (needs --host)
     #[arg(long)]
     precision: Option<f64>,
+    /// Share of a fragment's minimizers the top organism must hit to be assigned (0 = off)
+    #[arg(long, default_value_t = 0.15, value_parser = unit_fraction)]
+    min_frac: f64,
     /// Threads classifying reads (plus one reading R1 and one reading R2)
     #[arg(short = 't', long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..))]
     threads: u64,
@@ -111,7 +114,15 @@ impl Common {
             reads_out: None,
             unmatched_out: None,
             unmatched_n: 0,
+            min_frac: self.min_frac,
         }
+    }
+}
+
+fn unit_fraction(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(f) if (0.0..=1.0).contains(&f) => Ok(f),
+        _ => Err(format!("{s} is not a number from 0 to 1")),
     }
 }
 

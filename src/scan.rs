@@ -207,6 +207,14 @@ fn read_fragments(
     Ok((n, stopped))
 }
 
+/// The strict rule: the top organism has at least 2 marker hits, at least 90 % of all
+/// marker hits, and at least `min_frac` of the fragment's minimizers. The last test
+/// scales with read length: a long host read can pick up 2 stray markers of another
+/// organism and none of its own.
+fn assigned(best: u32, total: u32, minimizers: usize, min_frac: f64) -> bool {
+    best >= 2 && best * 10 >= total * 9 && best as f64 >= min_frac * minimizers as f64
+}
+
 /// Index hits of one fragment.
 struct Call {
     hits: Vec<(usize, u32, u32)>, // (organism, marker hits, markers not hit before in this scan)
@@ -381,6 +389,8 @@ pub struct Opts {
     pub reads_out: Option<String>,
     pub unmatched_out: Option<String>,
     pub unmatched_n: usize,
+    /// share of the fragment's minimizers the top organism must hit (0 = off)
+    pub min_frac: f64,
 }
 
 /// Fragments sampled before --precision may stop the scan.
@@ -582,7 +592,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 distinct[g] += d as u64;
             }
             let category = match c.hits.iter().max_by_key(|h| h.1) {
-                Some(&(g, best, _)) if best >= 2 && best * 10 >= total * 9 => {
+                Some(&(g, best, _)) if assigned(best, total, c.minimizers, opts.min_frac) => {
                     reads[g] += 1;
                     assigned_hits += total as u64;
                     off_target += (total - best) as u64;
@@ -724,6 +734,15 @@ mod tests {
             d.add(crate::kmer::mix(k / 3)); // clusters of 3
         }
         assert!(d.shift > 0 && (d.design_effect() - 3.0).abs() < 0.01, "{}", d.design_effect());
+    }
+
+    #[test]
+    fn min_frac_scales_with_minimizers() {
+        use super::assigned;
+        assert!(assigned(2, 2, 40, 0.0));
+        assert!(!assigned(2, 2, 40, 0.1), "2 of 40 minimizers is below 10 %");
+        assert!(assigned(4, 4, 40, 0.1));
+        assert!(!assigned(1, 1, 5, 0.0) && !assigned(8, 10, 40, 0.0), "2-hit and 90 % rules still apply");
     }
 
     #[test]

@@ -45,6 +45,7 @@ target/release/bycatch scan -i idx --host fish sample_R1.fastq.gz sample_R2.fast
 | `--every N` | classify 1 read (or pair) in N, default 50; `--every 1` classifies all |
 | `--max-reads M` | stop after classifying M reads (or pairs), or at the end of the file if that comes first |
 | `--precision P` | stop once the contamination 95 % CI is within ± P percentage points (needs `--host`; checked every 4,096 fragments, from 10,000 on) |
+| `--min-frac F` | the top organism must also hit at least this share of the fragment's minimizers, default 0.15; 0 turns it off; see below |
 | `-t, --threads T` | threads classifying reads, default 4 (plus one reading R1 and one reading R2) |
 | `--reads FILE` | also write one line per classified read |
 | `--unmatched-out FILE` | write a random sample of `unmatched` fragments as FASTA, for BLAST or sylph |
@@ -317,8 +318,8 @@ For a sampled read (or pair):
 | no hit and no minimizer at all (poly-G, simple repeats, shorter than 27 bp) | `low_complexity` |
 | no hit otherwise | `unmatched` |
 | only `shared` hits | `shared` |
-| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits | that organism |
-| markers of one organism only, but just 1 hit | `weak` |
+| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits **and** hits at least `--min-frac` (default 15 %) of the fragment's minimizers | that organism |
+| markers of one organism only, but too few hits for the rule above | `weak` |
 | anything else (markers of several organisms) | `conflict` |
 
 Shared hits never vote. Two hits are required because one k-mer can match by chance or
@@ -326,6 +327,15 @@ through a single sequencing error. The 90 % rule tolerates an odd marker from an
 organism (an error creating a k-mer that exists elsewhere) without letting a chimera be
 assigned. The same rule works for long reads: they lose k-mers to errors but have
 hundreds of minimizers.
+
+The 2-hit floor does not grow with read length. A 2×150 host read has ~25 minimizers,
+and about 3 in 10,000 hit 2 stray markers of another organism and no host marker. Their
+other minimizers match nothing, or only `shared` k-mers, so the 90 % rule does not stop
+them. `--min-frac` also asks for a share of the fragment's minimizers, as Kraken2's
+`--confidence` does. On simulated cod reads those false calls hit a median 11–18 % of
+their minimizers, and true contaminant reads 83–88 %. The default 0.15 was picked on one
+simulated set and checked on fresh ones (COMPARISON.md, "Post-hoc"). `--min-frac 0` gives
+the rule of earlier versions.
 
 The result is a fraction of **fragments**. A 3 Gb genome does not count more than a
 5 Mb genome because it has more k-mers; each read is judged on its own.

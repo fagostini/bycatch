@@ -10,7 +10,9 @@ CNT, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
 SETRE = re.compile(r"(?:(?P<setting>[a-z]+[0-9.]+)_)?L(?P<L>\d+)_(?P<mix>low|mid|high)_s(?P<seed>\d)$")
 DEFAULT = {"kraken2_ncbi": "c0", "kraken2_flat": "c0", "kunpeng_ncbi": "c0", "kunpeng_flat": "c0",
-           "deacon": "a2", "bycatch": "-", "sourmash": "th50000"}
+           "deacon": "a2", "bycatch": "-", "sourmash": "th50000", "bycatch_mf": "f0"}
+# reported seeds; the post-hoc --min-frac study reports fresh seeds 4,5
+SEEDS = tuple(int(x) for x in os.environ.get("REPORT_SEEDS", "2,3").split(","))
 
 
 def truth(set_name):
@@ -76,7 +78,7 @@ for tool in {r["tool"] for r in rows}:
     cand = [r for r in rows if r["tool"] == tool and r["L"] == 150 and r["mix"] == "mid" and r["seed"] == 1]
     if not cand:
         continue
-    if tool.startswith(("kraken2", "kunpeng")):
+    if tool.startswith(("kraken2", "kunpeng", "bycatch_mf")):
         key, best = "macro_f1", max
     elif tool == "deacon":
         key, best = "contam_f1", max
@@ -89,7 +91,7 @@ with open(f"{OUT}/selected.tsv", "w") as o:
     for t, s in sorted(sel.items()):
         o.write(f"{t}\t{s}\t(default {DEFAULT.get(t, '-')})\n")
 
-# reported numbers: seeds 2-3, mean, at the selected and default settings
+# reported numbers: mean over SEEDS, at the selected and default settings
 with open(f"{OUT}/summary.tsv", "w") as o:
     o.write("\t".join(["tool", "setting", "which", "L", "mix"] + COLS) + "\n")
     for tool in sorted(sel):
@@ -99,7 +101,7 @@ with open(f"{OUT}/summary.tsv", "w") as o:
             for L in (50, 100, 150):
                 for mix in ("low", "mid", "high"):
                     rs = [r for r in rows if r["tool"] == tool and r["setting"] == s and r["L"] == L
-                          and r["mix"] == mix and r["seed"] in (2, 3)]
+                          and r["mix"] == mix and r["seed"] in SEEDS]
                     if not rs:
                         continue
                     vals = []
