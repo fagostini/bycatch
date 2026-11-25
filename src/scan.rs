@@ -110,7 +110,7 @@ const BATCH: usize = 4096;
 /// Adapters read through after a short insert, and primer dimers: Illumina TruSeq
 /// (read 1 and 2, and the P5 side), Nextera (read 1 and 2, mosaic end), the P5 and P7
 /// flow-cell ends that follow the index, MGI (read 1 and 2).
-/// shortcut: built-in list and exact 19-mers only; add a --adapters FASTA if other kits
+/// shortcut: built-in list and exact 17-mers only; add a --adapters FASTA if other kits
 /// show up as `unmatched`.
 const ADAPTERS: [&[u8]; 10] = [
     b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC",

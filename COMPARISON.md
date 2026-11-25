@@ -41,23 +41,47 @@ Hyper-Gen was considered and left out. It sketches whole genomes to estimate
 genome-to-genome ANI, like Mash or skani, and has no read classification or containment
 mode.
 
+### Feature grid
+
+Features some of the tools have and others lack. ✓ present, ✗ absent, NA not applicable
+(sylph and sourmash work at sample level, not per read).
+
+| Feature | bycatch | Kraken2 | Kun-peng | deacon | sylph | sourmash |
+|---|---|---|---|---|---|---|
+| Names an organism for each read | ✓ | ✓ | ✓ | ✗ | NA | NA |
+| Per-read output | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| Per-read threshold relative to read length | ✓ | ✓ | ✓ | ✓ | NA | NA |
+| Places reads shared between genomes on a taxonomy (LCA) | ✗ ¹ | ✓ | ✓ | ✗ | NA | NA |
+| Builds without a taxonomy | ✓ | ✗ | ✗ | ✓ | ✓ | ✓ |
+| Writes host-depleted reads | ✓ | ✗ ² | ✗ ² | ✓ | ✗ | ✗ |
+| Adds genomes without a full rebuild | ✓ | ✗ | ✗ | ✓ | ✓ | ✓ |
+| Kraken-style report, for Kraken tooling | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ |
+| ANI estimate | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
+| Prebuilt databases | ✗ | ✓ | ✓ ³ | ✓ | ✓ | ✓ |
+
+¹ One level only: optional user-defined groups collect k-mers their members share.
+² `--classified-out` / `--unclassified-out` split reads by any hit or none, not by taxon.
+KrakenTools extracts reads by taxon.
+³ It converts Kraken2 databases (`kun_peng hashshard`).
+
 ### Gaps in existing tools, and what bycatch does about them
 
-| Gap | Tools that have it | bycatch | How |
+Features useful for contamination screening that none of the five other tools provide, or
+that they provide only in part. Features one of them already has (a taxonomy and LCA,
+host-depleted output, databases larger than RAM) are not gaps; they are in the feature grid
+and the table above.
+
+| Missing feature | Tools lacking it | bycatch | How |
 |---|---|---|---|
-| Must read every read before giving an answer | Kraken2, Kun-peng, deacon | Addressed | `--every N` samples across the whole file. `--precision` stops once the interval is narrow enough. |
-| No uncertainty on the contamination figure | Kraken2, Kun-peng, deacon, sourmash | Addressed | 95 % Wilson intervals, corrected for PCR and optical duplicates. sylph reports ANI intervals, not abundance intervals. |
-| Each sample judged alone | all | Addressed | `bycatch run`: one matrix per run, with background, elevated-sample and index-hopping flags. |
-| Unexplained reads land in one "unclassified" bucket | Kraken2, Kun-peng, deacon | Addressed | Separate `shared`, `adapter`, `low_complexity`, `weak`, `conflict` and `unmatched` categories, plus `--unmatched-out` for follow-up with BLAST. |
-| A taxonomy is needed to build | Kraken2, Kun-peng | Addressed | A plain list of genomes. Shared k-mers are tagged, not placed on a tree. |
-| Adding a genome means a full rebuild | Kraken2, Kun-peng | Addressed | `bycatch add` merges new genomes into an existing index. |
-| No organism names | deacon | Addressed | Each read gets one panel organism. |
-| No read-level output | sylph, sourmash | Addressed | `--reads` writes one line per classified read. |
-| Reads shared within a genus are lost | bycatch | Partly addressed | Optional groups in the genome list: k-mers shared only within a group go to it. One level, user-defined; Kraken2 and Kun-peng place reads on a full taxonomy by LCA. |
-| Strains or species that differ from the reference | bycatch, deacon, Kraken2, Kun-peng | Not addressed | All rely on exact k-mer matches. Approximate methods (Centrifuger, Metabuli, alignment) tolerate divergence. |
-| An index larger than RAM | bycatch | Not addressed | Lookups are random: from disk they are orders of magnitude slower. Kun-peng loads its database in chunks. |
-| Host-depleted FASTQ output | sylph, sourmash; Kraken2 and Kun-peng only via KrakenTools | Addressed | `--depleted-out` writes the reads not assigned to the host or its group, gzipped, in input order. deacon writes it directly too. |
-| Close relatives of a panel organism that are not in the panel | all | Not addressed | No reference, so every tool calls them the nearest panel organism, or nothing. |
+| An answer from a sample of the reads, stopping once it is precise enough | all five: each reads or sketches every read | Addressed | `--every N` samples across the whole file. `--precision` stops once the confidence interval is narrow enough. |
+| A confidence interval on the contamination fraction | all five (sylph gives intervals on ANI, not on abundance) | Addressed | 95 % Wilson intervals on every organism and on total contamination. |
+| An estimate corrected for PCR and optical duplicates | all five | Addressed | Duplicates are found from read starts. The design effect widens the interval. |
+| A run-level view: background contamination, outlier samples, index hopping | all five: each sample is judged alone | Addressed | `bycatch run`: one matrix per run, with `background`, `elevated` and `index_hopping` flags. |
+| A contamination figure relative to a declared host | Kraken2, Kun-peng, sylph, sourmash report taxa, not host versus contaminant; deacon reports host versus not, without names | Addressed | `--host` gives the contamination percent, its interval and the organisms behind it. |
+| Reasons for unassigned reads | Kraken2, Kun-peng and deacon give one "unclassified" bucket; sylph and sourmash have no read level | Addressed | Separate `shared`, `adapter`, `low_complexity`, `weak`, `conflict` and `unmatched` categories, plus `--unmatched-out` for follow-up with BLAST. |
+| A warning when hits pile up on a few markers (a conserved gene such as 16S, a repeat, an amplicon) | all five (KrakenUniq, not compared here, counts distinct k-mers) | Addressed | The `diversity` score and `low_diversity` note. |
+| Host depletion and contaminant identification in one pass | deacon depletes without names; Kraken2 and Kun-peng name reads but need KrakenTools to extract them | Addressed | `--depleted-out` writes the non-host reads during the same scan that reports the organisms. |
+| Flagging a close relative of a panel organism that is not in the panel | all five | Not addressed | With no reference, bycatch also calls it the nearest panel organism, or nothing. |
 
 ## Fair benchmark: cod-host panel (2026-11-24)
 
@@ -639,6 +663,8 @@ contaminants, scale and statistics.
 - `bycatch add` merges new genomes into an existing index without rereading the old ones;
   Kraken2 rebuilds its whole database.
 - MultiQC custom-content files from `scan --mqc` and `run`.
+- `--depleted-out` writes host-depleted FASTQ during the same scan that names the
+  contaminants; deacon depletes without names, Kraken2 needs KrakenTools to extract reads.
 
 **What published tools do better**
 
@@ -650,8 +676,7 @@ contaminants, scale and statistics.
   and groups, and an index that fits in RAM.
 - Statistics: sylph reports ANI and coverage. bycatch now reports 95 % Wilson intervals
   and a Bracken-like EM estimate for `weak` and `conflict` reads (see README.md), but
-  `shared` reads are not redistributed. Group ids now exist in the index, so a group
-  catches what its members share.
+  `shared` reads are not redistributed.
 - Threads: closed. Classification now runs on `--threads` workers: one real lane pair at
   `--every 1` takes 5.1 s instead of 34.1 s with 16 threads.
 

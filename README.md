@@ -328,7 +328,7 @@ For a sampled read (or pair):
 
 | Condition | Category |
 |---|---|
-| no hit, but an adapter 27-mer anywhere in the read or mate | `adapter` |
+| no hit, but an adapter 17-mer anywhere in the read or mate | `adapter` |
 | no hit and no minimizer at all (poly-G, simple repeats, shorter than 27 bp) | `low_complexity` |
 | no hit otherwise | `unmatched` |
 | only `shared` hits | `shared` |
@@ -461,11 +461,11 @@ or run sylph against GTDB, to find organisms missing from the index.
 | File | Content |
 |---|---|
 | `src/kmer.rs` | 2-bit encoding, canonical k-mers, hash, low-complexity filter, minimizers |
-| `src/index.rs` | build, add and repack (per-genome runs, merge, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
-| `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, duplicates, Wilson intervals, EM, `--precision`, report |
+| `src/index.rs` | build, add and repack (per-genome runs, merge, groups, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
+| `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, groups, duplicates, Wilson intervals, EM, `--precision`, report, `--depleted-out` |
 | `src/run.rs` | `run`: many samples, matrix, background / elevated / index-hopping flags, MultiQC files |
 | `src/main.rs` | command line |
-| `tests/synthetic.rs` | end-to-end test on three random genomes sharing a block: scan, threads, adapters, `--precision`, `add`, `run`, MultiQC |
+| `tests/synthetic.rs` | end-to-end test on three random genomes sharing a block: scan, threads, adapters, `--precision`, `add`, `run`, MultiQC; groups, over 255 organisms, `--depleted-out` |
 
 ```bash
 cargo test --release
