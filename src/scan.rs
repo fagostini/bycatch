@@ -33,16 +33,19 @@ fn diversity(hits: u64, distinct: u64, markers: u64) -> Option<f64> {
     Some(distinct as f64 / (-m * (-(hits as f64) / m).exp_m1()))
 }
 
+/// A sampled R2 record: its sequence, plus id and qualities when reads are written out.
+type Mate = (Vec<u8>, Option<Raw>);
+
 /// Reads R2 on a background thread and hands over the sequences of the sampled records.
 struct MateReader {
-    rx: Receiver<Vec<Vec<u8>>>,
-    batch: std::vec::IntoIter<Vec<u8>>,
+    rx: Receiver<Vec<Mate>>,
+    batch: std::vec::IntoIter<Mate>,
     thread: Option<JoinHandle<Res<u64>>>,
 }
 
 impl MateReader {
-    fn start(path: String, every: u64) -> MateReader {
-        let (tx, rx) = sync_channel::<Vec<Vec<u8>>>(16);
+    fn start(path: String, every: u64, raw: bool) -> MateReader {
+        let (tx, rx) = sync_channel::<Vec<Mate>>(16);
         let thread = std::thread::spawn(move || -> Res<u64> {
             let mut reader = open(&path)?;
             let (mut n, mut batch) = (0u64, Vec::new());
@@ -50,7 +53,8 @@ impl MateReader {
                 let rec = rec.map_err(|e| format!("{path}: {e}"))?;
                 n += 1;
                 if (n - 1).is_multiple_of(every) {
-                    batch.push(rec.seq().into_owned());
+                    let r = if raw { Some(Raw::of(&rec, &path)?) } else { None };
+                    batch.push((rec.seq().into_owned(), r));
                     if batch.len() == 1024 && tx.send(std::mem::take(&mut batch)).is_err() {
                         break; // main thread stopped on an error
                     }
@@ -62,7 +66,7 @@ impl MateReader {
         MateReader { rx, batch: Vec::new().into_iter(), thread: Some(thread) }
     }
 
-    fn next(&mut self) -> Res<Vec<u8>> {
+    fn next(&mut self) -> Res<Mate> {
         loop {
             if let Some(s) = self.batch.next() {
                 return Ok(s);
@@ -148,12 +152,33 @@ const C_ADAPTER: usize = 3;
 const C_LOW: usize = 4;
 const C_UNMATCHED: usize = 5;
 
+/// Id and qualities of a record, kept only to write the reads out again.
+struct Raw {
+    id: Vec<u8>,
+    qual: Vec<u8>,
+}
+
+impl Raw {
+    fn of(rec: &needletail::parser::SequenceRecord, path: &str) -> Res<Raw> {
+        let qual = rec.qual().ok_or_else(|| format!("{path}: --depleted-out needs FASTQ, not FASTA"))?;
+        Ok(Raw { id: rec.id().to_vec(), qual: qual.to_vec() })
+    }
+
+    /// The record as FASTQ, with sequence `seq`.
+    fn fastq(&self, seq: &[u8], out: &mut Vec<u8>) {
+        for part in [b"@", &self.id[..], b"\n", seq, b"\n+\n", &self.qual[..], b"\n"] {
+            out.extend_from_slice(part);
+        }
+    }
+}
+
 /// One sampled read, or read pair.
 struct Fragment {
     rec: u64,    // record number in R1, from 1
     id: Vec<u8>, // empty unless read ids are written out
     seq: Vec<u8>,
     mate: Option<Vec<u8>>,
+    raw: Option<(Raw, Option<Raw>)>, // R1 and R2 id and qualities, for --depleted-out
 }
 
 /// Reads R1 (and R2 through a MateReader) and sends the sampled fragments in batches.
@@ -165,10 +190,11 @@ fn read_fragments(
     every: u64,
     max_reads: Option<u64>,
     keep_ids: bool,
+    keep_raw: bool,
     tx: SyncSender<Vec<Fragment>>,
 ) -> Res<(u64, bool)> {
     let mut reader = open(r1)?;
-    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every));
+    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every, keep_raw));
     let (mut n, mut sampled, mut stopped) = (0u64, 0u64, false);
     let mut batch = Vec::with_capacity(BATCH);
     while let Some(rec) = reader.next() {
@@ -177,12 +203,16 @@ fn read_fragments(
         if !(n - 1).is_multiple_of(every) {
             continue;
         }
-        let mate = match &mut mates {
-            Some(m) => Some(m.next()?),
-            None => None,
+        let (mate, mate_raw) = match &mut mates {
+            Some(m) => {
+                let (seq, raw) = m.next()?;
+                (Some(seq), raw)
+            }
+            None => (None, None),
         };
         let id = if keep_ids { rec.id().to_vec() } else { Vec::new() };
-        batch.push(Fragment { rec: n, id, seq: rec.seq().into_owned(), mate });
+        let raw = if keep_raw { Some((Raw::of(&rec, r1)?, mate_raw)) } else { None };
+        batch.push(Fragment { rec: n, id, seq: rec.seq().into_owned(), mate, raw });
         sampled += 1;
         if max_reads == Some(sampled) {
             stopped = true;
@@ -410,6 +440,8 @@ pub struct Opts {
     pub unmatched_n: usize,
     /// share of the fragment's minimizers the top organism must hit (0 = off)
     pub min_frac: f64,
+    /// write the fragments not assigned to the host (or its group) to <prefix>[_R1/_R2].fastq.gz
+    pub depleted_out: Option<String>,
 }
 
 /// Fragments sampled before --precision may stop the scan.
@@ -569,11 +601,87 @@ impl Reservoir {
     }
 }
 
+/// gzip writer of one FASTQ on its own thread, so compression runs beside classification.
+struct GzThread {
+    tx: SyncSender<Vec<u8>>,
+    thread: JoinHandle<Res<()>>,
+}
+
+impl GzThread {
+    fn start(path: String) -> Res<GzThread> {
+        let file = std::fs::File::create(&path).map_err(|e| format!("{path}: {e}"))?;
+        let (tx, rx) = sync_channel::<Vec<u8>>(4);
+        let thread = std::thread::spawn(move || -> Res<()> {
+            // level 1: output size matters less than keeping up with classification
+            let mut w = flate2::write::GzEncoder::new(std::io::BufWriter::new(file), flate2::Compression::fast());
+            for chunk in rx {
+                w.write_all(&chunk).map_err(|e| format!("{path}: {e}"))?;
+            }
+            w.finish()?.flush().map_err(|e| format!("{path}: {e}"))?;
+            Ok(())
+        });
+        Ok(GzThread { tx, thread })
+    }
+
+    fn send(&self, chunk: Vec<u8>) -> Res<()> {
+        // a failed send means the writer stopped on an error: finish() reports it
+        let _ = self.tx.send(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> Res<()> {
+        drop(self.tx);
+        self.thread.join().map_err(|_| "--depleted-out writer thread panicked")?
+    }
+}
+
+/// `--depleted-out`: the FASTQ of each batch is built in order, then handed to the writers.
+struct Depleted {
+    r1: Vec<u8>,
+    r2: Vec<u8>,
+    w1: GzThread,
+    w2: Option<GzThread>,
+}
+
+impl Depleted {
+    fn start(prefix: &str, paired: bool) -> Res<Depleted> {
+        let (w1, w2) = if paired {
+            (GzThread::start(format!("{prefix}_R1.fastq.gz"))?, Some(GzThread::start(format!("{prefix}_R2.fastq.gz"))?))
+        } else {
+            (GzThread::start(format!("{prefix}.fastq.gz"))?, None)
+        };
+        Ok(Depleted { r1: Vec::new(), r2: Vec::new(), w1, w2 })
+    }
+
+    fn flush_batch(&mut self) -> Res<()> {
+        self.w1.send(std::mem::take(&mut self.r1))?;
+        if let Some(w2) = &self.w2 {
+            w2.send(std::mem::take(&mut self.r2))?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Res<()> {
+        self.flush_batch()?;
+        self.w1.finish()?;
+        self.w2.map_or(Ok(()), GzThread::finish)
+    }
+}
+
 /// Classifies one sample (a file, or a read pair).
 pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: Option<&str>) -> Res<Report> {
     if opts.precision.is_some() && host.is_none() {
         return Err("--precision needs --host: it is the precision of the contamination percent".into());
     }
+    if opts.depleted_out.is_some()
+        && (host.is_none() || opts.every != 1 || opts.max_reads.is_some() || opts.precision.is_some())
+    {
+        return Err("--depleted-out needs --host and --every 1, without --max-reads or --precision: it writes every non-host read".into());
+    }
+    let mut depleted = match &opts.depleted_out {
+        Some(prefix) => Some(Depleted::start(prefix, r2.is_some())?),
+        None => None,
+    };
     let host_group = host.and_then(|h| idx.group_of[h]);
     let mut dump = match &opts.reads_out {
         Some(p) => {
@@ -602,8 +710,10 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     // the pool classifies a batch while the reader decompresses the next ones.
     let (tx, rx) = sync_channel::<Vec<Fragment>>(4);
     let keep_ids = dump.is_some() || opts.unmatched_out.is_some();
+    let keep_raw = depleted.is_some();
     let (r1s, r2s, every, max_reads) = (r1.to_string(), r2.map(str::to_string), opts.every, opts.max_reads);
-    let reader = std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), every, max_reads, keep_ids, tx));
+    let reader =
+        std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), every, max_reads, keep_ids, keep_raw, tx));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(opts.threads).build()?;
     for batch in rx {
         let calls: Vec<Call> =
@@ -622,6 +732,14 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 distinct[g] += d as u64;
             }
             let decision = call(&c.hits, idx.genomes, &idx.group_of, c.minimizers, opts.min_frac);
+            if let (Some(d), Some((raw1, raw2))) = (&mut depleted, &f.raw) {
+                if !decision.is_some_and(|(g, _)| Some(g) == host || Some(g) == host_group) {
+                    raw1.fastq(&f.seq, &mut d.r1);
+                    if let (Some(raw2), Some(seq2)) = (raw2, &f.mate) {
+                        raw2.fastq(seq2, &mut d.r2);
+                    }
+                }
+            }
             let category = match decision {
                 Some((g, support)) => {
                     reads[g] += 1;
@@ -672,6 +790,9 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 )?;
             }
         }
+        if let Some(d) = &mut depleted {
+            d.flush_batch()?;
+        }
         if let (Some(p), Some(h)) = (opts.precision, host) {
             let contam: u64 = (0..n_org).filter(|&g| g != h && Some(g) != host_group).map(|g| reads[g]).sum();
             let (lo, hi) = wilson(contam as f64 / sampled as f64, sampled as f64 / dups.design_effect());
@@ -682,6 +803,9 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
         }
     }
     let (n, reader_stopped) = reader.join().map_err(|_| "R1 reader thread panicked")??;
+    if let Some(d) = depleted {
+        d.finish()?;
+    }
     if let Some(w) = &mut dump {
         w.flush()?;
     }

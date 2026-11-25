@@ -318,3 +318,57 @@ fn more_than_255_organisms() {
     assert_eq!(run(&["scan", "-i", &p("added"), "--every", "1", &p("reads.fq")]), report);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `--depleted-out` writes exactly the pairs not assigned to the host, in input order,
+/// with ids, sequences and qualities intact.
+#[test]
+fn depleted_out() {
+    use std::io::Read;
+    let dir = std::env::temp_dir().join(format!("bycatch_depleted_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let mut rng = Rng(0xA0761D6478BD642F);
+    let (host, other) = (rng.seq(200_000), rng.seq(50_000));
+    std::fs::write(p("list.tsv"), write_genomes(&dir, &[("host", &host, None), ("other", &other, None)])).unwrap();
+    run(&["build", &p("list.tsv"), "--out", &p("idx")]);
+    let (mut fq1, mut fq2, mut expect1, mut expect2) = (String::new(), String::new(), String::new(), String::new());
+    for i in 0..600 {
+        // every 3rd pair from `other`, every 7th random; the rest host
+        let (r1, r2) = match (i % 3, i % 7) {
+            (_, 0) => (rng.seq(100), rng.seq(100)),
+            (0, _) => {
+                let s = rng.next() as usize % (other.len() - 300);
+                (other[s..s + 100].to_vec(), revcomp(&other[s + 200..s + 300]))
+            }
+            _ => {
+                let s = rng.next() as usize % (host.len() - 300);
+                (host[s..s + 100].to_vec(), revcomp(&host[s + 200..s + 300]))
+            }
+        };
+        let q: String = (0..100).map(|k| (b'!' + ((i + k) % 40) as u8) as char).collect();
+        let (a, b) = (format!("@p{i} 1:N\n{}\n+\n{q}\n", String::from_utf8_lossy(&r1)), format!("@p{i} 2:N\n{}\n+\n{q}\n", String::from_utf8_lossy(&r2)));
+        fq1 += &a;
+        fq2 += &b;
+        if i % 3 == 0 || i % 7 == 0 {
+            expect1 += &a;
+            expect2 += &b;
+        }
+    }
+    std::fs::write(p("r1.fq"), fq1).unwrap();
+    std::fs::write(p("r2.fq"), fq2).unwrap();
+    let report = run(&["scan", "-i", &p("idx"), "--host", "host", "--every", "1", "--depleted-out", &p("dep"), &p("r1.fq"), &p("r2.fq")]);
+    let gunzip = |f: &str| {
+        let mut s = String::new();
+        flate2::read::MultiGzDecoder::new(std::fs::File::open(p(f)).unwrap()).read_to_string(&mut s).unwrap();
+        s
+    };
+    assert_eq!(gunzip("dep_R1.fastq.gz"), expect1, "{report}");
+    assert_eq!(gunzip("dep_R2.fastq.gz"), expect2);
+    // refused without --every 1
+    let out = Command::new(env!("CARGO_BIN_EXE_bycatch"))
+        .args(["scan", "-i", &p("idx"), "--host", "host", "--depleted-out", &p("x"), &p("r1.fq"), &p("r2.fq")])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

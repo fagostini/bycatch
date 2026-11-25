@@ -55,6 +55,7 @@ target/release/bycatch scan -i idx --host fish sample_R1.fastq.gz sample_R2.fast
 | `-t, --threads T` | threads classifying reads, default 4 (plus one reading R1 and one reading R2) |
 | `--reads FILE` | also write one line per classified read |
 | `--unmatched-out FILE` | write a random sample of `unmatched` fragments as FASTA, for BLAST or sylph |
+| `--depleted-out PREFIX` | write every read (or pair) not assigned to the host or its group to `PREFIX_R1.fastq.gz` / `PREFIX_R2.fastq.gz` (`PREFIX.fastq.gz` single-end), in input order; needs `--host` and `--every 1` |
 | `--unmatched-n N` | fragments in `--unmatched-out`, default 1000 |
 | `--mqc PREFIX` | write MultiQC files `PREFIX_bycatch_mqc.tsv` and `PREFIX_bycatch_stats_mqc.tsv` |
 | `--name NAME` | sample name in the MultiQC files, default from the R1 file name |
@@ -442,6 +443,13 @@ One line per classified fragment:
 `read_id  category  unique_hits  shared_hits  minimizers  sequence`.
 `unique_hits` lists the organisms hit, such as `fish:14,mouse:1`. The sequence is the R1 sequence.
 Useful to check odd calls, for example by BLAST.
+
+`--depleted-out PREFIX` writes every fragment not assigned to the host or its group, as
+gzipped FASTQ with the original ids and qualities, in input order: organisms, groups,
+`shared`, `weak`, `conflict`, `adapter`, `low_complexity` and `unmatched` reads are all
+kept, so a host read that hits only `shared` k-mers stays in. It needs FASTQ input,
+`--host` and `--every 1`. Compression (gzip level 1) runs on one thread per file next to
+classification.
 
 `--unmatched-out FILE` writes `--unmatched-n` fragments drawn at random from all
 `unmatched` ones (reservoir sampling with a fixed seed, so the same input gives the same

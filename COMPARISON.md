@@ -30,7 +30,7 @@ speed, resources and accuracy are in "Fair benchmark" below. They are not used h
 
 | Tool | What it does | Strengths | Weaknesses |
 |---|---|---|---|
-| **bycatch** | Assigns each read or pair to one of the organisms in a fixed panel, without a taxonomy, and reports the share of each. | Exact canonical-minimizer matches, so no hash collisions. Explicit `shared` category instead of a tree. Categories for adapters, low-complexity reads and unmatched reads. `--every N` sampling and `--precision` early stop. Confidence intervals corrected for duplicates, plus an EM estimate. Run-level QC across samples (background, elevated samples, index hopping). MultiQC output. Memory-mapped index shared by concurrent scans. Genomes can be added to an index without a rebuild. | No hierarchy: reads shared between organisms are not placed on a genus or family. Exact matching misses strains that differ from the reference. At most 255 organisms, and the index must fit in RAM. No filtered-FASTQ output. A new tool with a small user base. |
+| **bycatch** | Assigns each read or pair to one of the organisms in a fixed panel, without a taxonomy, and reports the share of each. | Exact canonical-minimizer matches, so no hash collisions. Explicit `shared` category instead of a tree; optional groups (e.g. a genus) collect what their members share. Host-depleted FASTQ output (`--depleted-out`). Categories for adapters, low-complexity reads and unmatched reads. `--every N` sampling and `--precision` early stop. Confidence intervals corrected for duplicates, plus an EM estimate. Run-level QC across samples (background, elevated samples, index hopping). MultiQC output. Memory-mapped index shared by concurrent scans. Genomes can be added to an index without a rebuild. | Hierarchy only through user-defined groups (one level, no taxonomy): reads shared outside a group are `shared`. Exact matching misses strains that differ from the reference. At most 1023 organisms and groups, and the index must fit in RAM. A new tool with a small user base. |
 | **Kraken2** | Assigns reads to taxa by lowest common ancestor (LCA) on hashed minimizers, using the NCBI or a custom taxonomy. | The established standard, with a large user base and many prebuilt databases. LCA places shared reads at genus or family level. A `--confidence` threshold. Bracken re-estimates abundance from its output. | Needs a taxonomy to build. The compact hash table allows a small rate of collisions. The whole database is loaded into RAM, or memory-mapped. No sampling, intervals or run-level view. |
 | **Kun-peng** | Kraken2-style LCA classifier, with a database split into chunks on disk. | Kraken2-compatible output and confidence threshold. Built for databases larger than RAM: chunks are loaded in turn. | Needs a taxonomy. A build writes large temporary files. Requires at least 3 threads. A young project. No sampling, intervals or run-level view. |
 | **deacon** | Minimizer filter: a read either matches the index or not, and is kept or removed. | Writes host-depleted FASTQ/FASTA, compressed, and streams from stdin and to stdout. Absolute (`-a`) and relative (`-r`) match thresholds. Index set operations (`union`, `diff`). Designed for host depletion, with a prebuilt human pangenome index. | Does not name organisms. Separating host, contaminant and unknown takes two indexes and two passes. No abundance report beyond a JSON summary. |
@@ -53,10 +53,10 @@ mode.
 | Adding a genome means a full rebuild | Kraken2, Kun-peng | Addressed | `bycatch add` merges new genomes into an existing index. |
 | No organism names | deacon | Addressed | Each read gets one panel organism. |
 | No read-level output | sylph, sourmash | Addressed | `--reads` writes one line per classified read. |
-| Reads shared within a genus are lost | bycatch | Not addressed | Kraken2 and Kun-peng place them by LCA. bycatch counts them as `shared`. |
+| Reads shared within a genus are lost | bycatch | Partly addressed | Optional groups in the genome list: k-mers shared only within a group go to it. One level, user-defined; Kraken2 and Kun-peng place reads on a full taxonomy by LCA. |
 | Strains or species that differ from the reference | bycatch, deacon, Kraken2, Kun-peng | Not addressed | All rely on exact k-mer matches. Approximate methods (Centrifuger, Metabuli, alignment) tolerate divergence. |
-| More than 255 organisms, or an index larger than RAM | bycatch | Not addressed | sylph and Kun-peng scale further. |
-| Host-depleted FASTQ output | bycatch, sylph, sourmash; Kraken2 and Kun-peng only via KrakenTools | Not addressed | deacon writes it directly. bycatch writes only a sample of `unmatched` reads. |
+| An index larger than RAM | bycatch | Not addressed | Lookups are random: from disk they are orders of magnitude slower. Kun-peng loads its database in chunks. |
+| Host-depleted FASTQ output | sylph, sourmash; Kraken2 and Kun-peng only via KrakenTools | Addressed | `--depleted-out` writes the reads not assigned to the host or its group, gzipped, in input order. deacon writes it directly too. |
 | Close relatives of a panel organism that are not in the panel | all | Not addressed | No reference, so every tool calls them the nearest panel organism, or nothing. |
 
 ## Fair benchmark: cod-host panel (2026-11-24)
@@ -615,7 +615,7 @@ These tools give a presence and abundance profile per sample, with no per-read c
 
 ## Where bycatch stands
 
-For a fixed list of up to 255 genomes, bycatch is exact, lean (15.4 GB for 23 genomes,
+For a fixed list of up to 1023 genomes and groups, bycatch is exact, lean (15.4 GB for 23 genomes,
 31.4 Gb; 45.8 GB for 95 organisms, ~119 Gb) and needs no taxonomy. It falls behind on close relatives, divergent
 contaminants, scale and statistics.
 
@@ -642,15 +642,16 @@ contaminants, scale and statistics.
 
 **What published tools do better**
 
-- Hierarchy: Kraken2/Bracken assign reads shared within a genus to the genus. bycatch loses
-  them (caveat 5 in PERFORMANCE.md).
+- Hierarchy: Kraken2/Bracken assign reads shared within a genus to the genus. bycatch does
+  so only for groups named in the genome list; other shared reads stay `shared`.
 - Divergence: Centrifuger, Metabuli and alignment tools still find a contaminant whose
   reference is a different strain or species. Exact 27-mers do not (caveat 6).
-- Scale: sylph or ganon handle thousands of genomes. bycatch is limited to 255 organisms and
-  an index that fits in RAM.
+- Scale: sylph or ganon handle thousands of genomes. bycatch is limited to 1023 organisms
+  and groups, and an index that fits in RAM.
 - Statistics: sylph reports ANI and coverage. bycatch now reports 95 % Wilson intervals
   and a Bracken-like EM estimate for `weak` and `conflict` reads (see README.md), but
-  `shared` reads are still not redistributed: that needs shared-group ids in the index.
+  `shared` reads are not redistributed. Group ids now exist in the index, so a group
+  catches what its members share.
 - Threads: closed. Classification now runs on `--threads` workers: one real lane pair at
   `--every 1` takes 5.1 s instead of 34.1 s with 16 threads.
 

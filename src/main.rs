@@ -52,6 +52,10 @@ enum Cmd {
         /// Write a random sample of unmatched fragments to this FASTA (for BLAST, sylph...)
         #[arg(long)]
         unmatched_out: Option<String>,
+        /// Write the reads not assigned to the host (or its group) to PREFIX_R1/_R2.fastq.gz
+        /// (PREFIX.fastq.gz for single-end); needs --host and --every 1
+        #[arg(long, value_name = "PREFIX")]
+        depleted_out: Option<String>,
         /// Fragments in --unmatched-out
         #[arg(long, default_value_t = 1000)]
         unmatched_n: usize,
@@ -115,6 +119,7 @@ impl Common {
             unmatched_out: None,
             unmatched_n: 0,
             min_frac: self.min_frac,
+            depleted_out: None,
         }
     }
 }
@@ -140,8 +145,8 @@ fn main() {
         Cmd::Build { genomes, out, jobs } => index::build(&genomes, &out, jobs),
         Cmd::Add { index, genomes, out, jobs } => index::add(&index, &genomes, &out, jobs),
         Cmd::Repack { index, out } => index::repack(&index, &out),
-        Cmd::Scan { common, reads, unmatched_out, unmatched_n, mqc, name, r1, r2 } => {
-            let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, ..common.opts() };
+        Cmd::Scan { common, reads, unmatched_out, unmatched_n, depleted_out, mqc, name, r1, r2 } => {
+            let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, depleted_out, ..common.opts() };
             let name = name.unwrap_or_else(|| sample_name(&r1));
             index::Index::load(&common.index).and_then(|idx| {
                 let mqc = mqc.as_deref().map(|m| (m, name.as_str()));

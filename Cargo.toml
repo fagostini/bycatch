@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 needletail = "0.6"
-# Not used directly: turns on the fast zlib backend for needletail's gzip reader.
+# The fast zlib backend, for needletail's gzip reader and the --depleted-out writer.
 flate2 = { version = "1", features = ["zlib-rs"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
