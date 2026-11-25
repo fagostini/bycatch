@@ -81,7 +81,7 @@ and the table above.
 | Reasons for unassigned reads | Kraken2, Kun-peng and deacon give one "unclassified" bucket; sylph and sourmash have no read level | Addressed | Separate `shared`, `adapter`, `low_complexity`, `weak`, `conflict` and `unmatched` categories, plus `--unmatched-out` for follow-up with BLAST. |
 | A warning when hits pile up on a few markers (a conserved gene such as 16S, a repeat, an amplicon) | all five (KrakenUniq, not compared here, counts distinct k-mers) | Addressed | The `diversity` score and `low_diversity` note. |
 | Host depletion and contaminant identification in one pass | deacon depletes without names; Kraken2 and Kun-peng name reads but need KrakenTools to extract them | Addressed | `--depleted-out` writes the non-host reads during the same scan that reports the organisms. |
-| Flagging a close relative of a panel organism that is not in the panel | all five | Not addressed | With no reference, bycatch also calls it the nearest panel organism, or nothing. |
+| Flagging a close relative of a panel organism that is not in the panel | all five | Partly addressed | Reads are still called the nearest panel organism, but `marker_density` and `identity_est` show their lower marker density. There is no automatic flag: read length and sequencing errors shift the density too. |
 
 ## Fair benchmark: cod-host panel (2026-11-24)
 
@@ -400,6 +400,76 @@ Seeds 4–5 means:
   seen. That is why it is marked post-hoc and was first checked on seeds 4–5.
 - Data: `data/bench/fair2/` (count tables, results, scripts; seeds 2–3 counts in
   `counts/bycatch_mf_s23/`).
+
+### Post-hoc: minimizer window and divergence columns (2026-11-25)
+
+**Not part of the pre-registered run.** The seed 1–3 sets were rebuilt from the same
+seeded scripts. At the default settings (`--min-frac 0.15`, w = 15), bycatch reproduced
+the stored seed 2–3 count tables byte for byte on all 18 sets.
+
+**Minimizer window (`build --window`).**
+- At 2×50 a read has about 4 minimizers with the default w = 15, and 19 % of host reads
+  stay unassigned.
+- The sweep tried w = 7, 11 and 15. The pick on 2×50 mid, seed 1, by macro F1 was
+  **w = 11** (0.9375; w = 7 0.9375 to four decimals but lower; w = 15 0.910).
+
+Seeds 2–3 means, 2×50:
+
+| Mix | Metric | w = 15 | w = 11 | w = 7 |
+|---|---|---|---|---|
+| low | host reads unassigned | 19.4 % | 12.8 % | 10.8 % |
+| | host reads called contaminant | 0.005 % | 0.011 % | 0.026 % |
+| | contamination F1 | 0.87 | 0.87 | 0.79 |
+| | macro F1 | 0.87 | 0.88 | 0.85 |
+| mid | macro F1 | 0.90 | 0.93 | 0.93 |
+| high | macro F1 | 0.91 | 0.94 | 0.95 |
+| | index size | 3.2 GB | 4.1 GB | 6.1 GB |
+| | build time | 2:05 | 2:14 | 2:54 |
+| | scan, 2 M pairs 2×50 | 2.3 s | 2.4 s | 3.2 s |
+
+- At 2×100 and 2×150 the window changes every metric by less than 0.005.
+- w = 11 recovers a third of the unassigned host reads at 2×50. It raises macro F1 by
+  0.01–0.03 and roughly doubles a still-small host false positive rate, for a 30 % larger
+  index.
+- w = 7 lets too many host reads through in the low mix.
+- The default stays 15. Use `--window 11` for panels scanned mostly with short reads.
+
+**Divergence columns (`marker_density`, `identity_est`).**
+
+Marker density of assigned fragments relative to the organism's unique fraction (1 means
+reads copied from the reference), seeds 2–3:
+
+| Reads → called | 2×50 | 2×100 | 2×150 |
+|---|---|---|---|
+| another cod individual → cod | 0.875 | 0.811 | 0.777 |
+| **Pacific cod → cod** | **0.738** | **0.587** | **0.555** |
+| human CHM13 → human | 0.937 | 0.907 | 0.869 |
+| mouse CAST/EiJ → mouse | 0.835 | 0.746 | 0.717 |
+| *E. coli* Sakai → *E. coli* (K-12 indexed) | 0.785 | 0.667 | 0.635 |
+| other same-species strains | 0.82–0.96 | 0.72–0.94 | 0.70–0.90 |
+
+- At a given read length, Pacific cod reads have clearly lower marker density than
+  another cod individual: 0.56 against 0.78 at 2×150.
+- Density also falls with read length for every class, because sequencing errors add up
+  along the read. And a real strain difference (*E. coli* O157 against K-12) falls in
+  between.
+- So no fixed threshold separates "relative not in the panel" from "the same species".
+  The columns ship **without** an automatic `divergent` flag.
+- Use them to compare an organism across samples of one run, or against the host's own
+  density in the same sample.
+
+**Real lane 1** (lane A of the benchmark run, paired-end, cod host, 2.2 M pairs, the
+95-organism index):
+- **Contamination:** `--min-frac 0.15` lowers it from 0.076 % to 0.019 %. Most of the drop
+  is fish that are close to cod in sequence: guppy −80 %, herring −81 %, zebrafish −87 %.
+  That matches the host-read false calls `--min-frac` targets.
+- **EM estimate:** stays at 0.127 %, since it redistributes `weak` reads either way.
+- **Old output:** at `--min-frac 0` the report equals the pre-`--min-frac` build
+  (627818f) in all shared columns.
+- **Speed:** unchanged. Medians of 3: `--every 50` 1.86 s before, 1.90 s now; `--every 1`
+  7.9 s before, 6.3 s now (noisy).
+
+Data: `data/bench/fair3/` (count tables, calibration, scripts).
 
 ## Measured head-to-head: Kraken2 and sourmash (2026-11-21)
 

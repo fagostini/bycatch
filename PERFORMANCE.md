@@ -37,6 +37,10 @@ compact layout existed.
 
 ### Scan
 
+Rechecked on 2026-11-25 after `--min-frac`, groups and `--depleted-out`: lane A with the
+95-organism index, 16 threads, medians of 3. `--every 50` took 1.86 s before and 1.90 s
+after; `--every 1` took 7.9 s before and 6.3 s after (noisy). No slowdown.
+
 One paired-end lane pair (lane A) from a NovaSeq run of 246 samples (the benchmark run) (~0.37 GB gz R1+R2, ~660 Mb),
 index warm in page cache:
 
