@@ -435,8 +435,9 @@ first 32 bases split a cluster, so D is a slight underestimate.
 proportion to abundance, as Bracken does for Kraken. Each marker hit of a fragment from
 organism g is taken to be a marker of g with probability 1 − ε, else of another organism;
 ε is the share of off-target hits among strictly assigned fragments (clamped to
-0.0001–0.5). Only organisms with at least 2 hits in the fragment are candidates, so 1-hit
-`weak` reads stay unassigned; `shared` and `unmatched` fragments are not moved. On
+0.0001–0.5). Only organisms with at least 2 hits in the fragment, and at least
+`--min-frac` of its minimizers, are candidates, so 1-hit `weak` reads and host reads with a
+few stray markers stay unassigned; `shared` and `unmatched` fragments are not moved. On
 simulated 150 nt reads (10 genomes) it cut the largest error from −0.13 to −0.07
 percentage points. On a real cod lane it raised every trace organism about 1.6×; there
 is no truth to tell whether that is closer. Without the 2-hit filter it raised them up to

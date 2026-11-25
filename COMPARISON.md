@@ -471,6 +471,25 @@ reads copied from the reference), seeds 2–3:
 
 Data: `data/bench/fair3/` (count tables, calibration, scripts).
 
+**EM after `--min-frac` (later the same day).** EM used to take back the `weak` reads that
+`--min-frac` rejected. It now applies the same evidence test to its candidates.
+
+| Set (truth) | EM before | EM now | Strict |
+|---|---|---|---|
+| Real lane 1 (unknown) | 0.127 % | 0.030 % | 0.019 % |
+| 2×150 low (0.07 %) | 0.122 % | 0.085 % | 0.077 % |
+| 2×100 low (0.07 %) | 0.098 % | 0.088 % | 0.080 % |
+| 2×150 mid (0.7 %) | 0.729 % | 0.681 % | 0.675 % |
+| 2×150 high (7 %) | 6.82 % | 6.68 % | 6.67 % |
+| 2×100 high (7 %) | 6.76 % | 6.69 % | 6.67 % |
+| 2×50, all mixes | | unchanged | |
+
+Simulated rows are seeds 2–3 means.
+- **Low mix:** the relative error falls from about 75 % to 20 %.
+- **High mix:** EM now underestimates more, by about 4.5 % of the truth instead of 2.5 %,
+  because it also turns away some true contaminant reads with few markers.
+- **`--min-frac 0`:** gives the old EM. Data: `data/bench/fair4/`.
+
 ## Measured head-to-head: Kraken2 and sourmash (2026-11-21)
 
 Superseded for accuracy by "Fair benchmark" above: the reads here come from the indexed

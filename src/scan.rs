@@ -276,6 +276,19 @@ fn call(hits: &[(usize, u32, u32)], genomes: usize, group_of: &[Option<usize>], 
     best.filter(|&(_, sum)| ok(sum, sum))
 }
 
+/// Hit pattern of a `weak` or `conflict` fragment for EM: the organisms with enough
+/// evidence to have been assigned on their own count, ignoring the 90 % rule. Single hits
+/// are dropped (on real lanes they inflated trace organisms ~10x), and so are organisms
+/// below `min_frac` of the minimizers: otherwise EM would hand back the host reads with a
+/// few stray markers that `--min-frac` keeps out. Groups are left out: their markers say
+/// too little to split among organisms.
+fn em_pattern(hits: &[(usize, u32, u32)], genomes: usize, minimizers: usize, min_frac: f64) -> Vec<(usize, u32)> {
+    hits.iter()
+        .filter(|h| h.0 < genomes && h.1 >= 2 && h.1 as f64 >= min_frac * minimizers as f64)
+        .map(|h| (h.0, h.1))
+        .collect()
+}
+
 /// Index hits of one fragment.
 struct Call {
     hits: Vec<(usize, u32, u32)>, // (organism, marker hits, markers not hit before in this scan)
@@ -772,10 +785,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                     idx.names[g].as_str()
                 }
                 None if !c.hits.is_empty() => {
-                    // single hits are dropped: on real lanes they inflated trace organisms ~10x.
-                    // EM splits among organisms only: group markers say too little.
-                    let pattern: Vec<(usize, u32)> =
-                        c.hits.iter().filter(|h| h.1 >= 2 && h.0 < idx.genomes).map(|h| (h.0, h.1)).collect();
+                    let pattern = em_pattern(&c.hits, idx.genomes, c.minimizers, opts.min_frac);
                     if !pattern.is_empty() {
                         *ambiguous.entry(pattern).or_default() += 1;
                     }
@@ -931,6 +941,15 @@ mod tests {
         assert!(!one(2, 2, 40, 0.1), "2 of 40 minimizers is below 10 %");
         assert!(one(4, 4, 40, 0.1));
         assert!(!one(1, 1, 5, 0.0) && !one(8, 10, 40, 0.0), "2-hit and 90 % rules still apply");
+    }
+
+    #[test]
+    fn em_pattern_needs_min_frac() {
+        use super::em_pattern;
+        let hits = [(0, 2, 0), (1, 6, 0), (2, 1, 0), (3, 9, 0)]; // 3 is a group
+        assert_eq!(em_pattern(&hits, 3, 40, 0.0), vec![(0, 2), (1, 6)], "as before at 0");
+        assert_eq!(em_pattern(&hits, 3, 40, 0.15), vec![(1, 6)], "2 of 40 is below 15 %");
+        assert!(em_pattern(&hits, 3, 100, 0.15).is_empty());
     }
 
     #[test]
