@@ -11,9 +11,22 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-fn open(path: &str) -> Res<Box<dyn FastxReader>> {
-    let r = if path == "-" { parse_fastx_stdin() } else { parse_fastx_file(path) };
+/// FASTQ/FASTA reader. BGZF input (bcl-convert's default) is inflated on `decoders`
+/// threads; plain gzip, plain text and stdin (`-`) go through needletail as they are.
+fn open(path: &str, decoders: usize) -> Res<Box<dyn FastxReader>> {
+    let r = if path == "-" {
+        parse_fastx_stdin()
+    } else if crate::bgzf::is_bgzf(path) {
+        needletail::parse_fastx_reader(crate::bgzf::BgzfReader::open(path, decoders)?)
+    } else {
+        parse_fastx_file(path)
+    };
     r.map_err(|e| format!("{path}: {e}").into())
+}
+
+/// Threads inflating each BGZF file: a quarter of the classifier threads, 1 to 4.
+fn decoders(threads: usize) -> usize {
+    (threads / 4).clamp(1, 4)
 }
 
 /// Below this diversity an organism's hits pile on few markers: a conserved gene
@@ -22,6 +35,18 @@ fn open(path: &str) -> Res<Box<dyn FastxReader>> {
 const LOW_DIVERSITY: f64 = 0.25;
 /// Too few hits to judge.
 const MIN_HITS_FOR_FLAG: u64 = 20;
+
+/// Marker density of an organism's assigned fragments against what reads copied from its
+/// reference would show (its unique fraction), and the per-base identity that ratio
+/// suggests: density ≈ identity^k when every k-mer needs k matching bases. Sequencing
+/// errors lower it too, so it is a relative measure, not an ANI.
+fn divergence(own_hits: u64, minimizers: u64, unique_fraction: f64) -> Option<(f64, f64)> {
+    if own_hits < MIN_HITS_FOR_FLAG || minimizers == 0 || unique_fraction <= 0.0 {
+        return None;
+    }
+    let density = own_hits as f64 / minimizers as f64 / unique_fraction;
+    Some((density, density.min(1.0).powf(1.0 / K as f64)))
+}
 
 /// Distinct markers hit, divided by the number expected if the same number of
 /// hits fell uniformly over the organism's markers: markers * (1 - e^(-hits/markers)).
@@ -33,24 +58,28 @@ fn diversity(hits: u64, distinct: u64, markers: u64) -> Option<f64> {
     Some(distinct as f64 / (-m * (-(hits as f64) / m).exp_m1()))
 }
 
+/// A sampled R2 record: its sequence, plus id and qualities when reads are written out.
+type Mate = (Vec<u8>, Option<Raw>);
+
 /// Reads R2 on a background thread and hands over the sequences of the sampled records.
 struct MateReader {
-    rx: Receiver<Vec<Vec<u8>>>,
-    batch: std::vec::IntoIter<Vec<u8>>,
+    rx: Receiver<Vec<Mate>>,
+    batch: std::vec::IntoIter<Mate>,
     thread: Option<JoinHandle<Res<u64>>>,
 }
 
 impl MateReader {
-    fn start(path: String, every: u64) -> MateReader {
-        let (tx, rx) = sync_channel::<Vec<Vec<u8>>>(16);
+    fn start(path: String, every: u64, raw: bool, decoders: usize) -> MateReader {
+        let (tx, rx) = sync_channel::<Vec<Mate>>(16);
         let thread = std::thread::spawn(move || -> Res<u64> {
-            let mut reader = open(&path)?;
+            let mut reader = open(&path, decoders)?;
             let (mut n, mut batch) = (0u64, Vec::new());
             while let Some(rec) = reader.next() {
                 let rec = rec.map_err(|e| format!("{path}: {e}"))?;
                 n += 1;
                 if (n - 1).is_multiple_of(every) {
-                    batch.push(rec.seq().into_owned());
+                    let r = if raw { Some(Raw::of(&rec, &path)?) } else { None };
+                    batch.push((rec.seq().into_owned(), r));
                     if batch.len() == 1024 && tx.send(std::mem::take(&mut batch)).is_err() {
                         break; // main thread stopped on an error
                     }
@@ -62,7 +91,7 @@ impl MateReader {
         MateReader { rx, batch: Vec::new().into_iter(), thread: Some(thread) }
     }
 
-    fn next(&mut self) -> Res<Vec<u8>> {
+    fn next(&mut self) -> Res<Mate> {
         loop {
             if let Some(s) = self.batch.next() {
                 return Ok(s);
@@ -106,7 +135,7 @@ const BATCH: usize = 4096;
 /// Adapters read through after a short insert, and primer dimers: Illumina TruSeq
 /// (read 1 and 2, and the P5 side), Nextera (read 1 and 2, mosaic end), the P5 and P7
 /// flow-cell ends that follow the index, MGI (read 1 and 2).
-/// shortcut: built-in list and exact 19-mers only; add a --adapters FASTA if other kits
+/// shortcut: built-in list and exact 17-mers only; add a --adapters FASTA if other kits
 /// show up as `unmatched`.
 const ADAPTERS: [&[u8]; 10] = [
     b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC",
@@ -148,27 +177,51 @@ const C_ADAPTER: usize = 3;
 const C_LOW: usize = 4;
 const C_UNMATCHED: usize = 5;
 
+/// Id and qualities of a record, kept only to write the reads out again.
+struct Raw {
+    id: Vec<u8>,
+    qual: Vec<u8>,
+}
+
+impl Raw {
+    fn of(rec: &needletail::parser::SequenceRecord, path: &str) -> Res<Raw> {
+        let qual = rec.qual().ok_or_else(|| format!("{path}: --depleted-out needs FASTQ, not FASTA"))?;
+        Ok(Raw { id: rec.id().to_vec(), qual: qual.to_vec() })
+    }
+
+    /// The record as FASTQ, with sequence `seq`.
+    fn fastq(&self, seq: &[u8], out: &mut Vec<u8>) {
+        for part in [b"@", &self.id[..], b"\n", seq, b"\n+\n", &self.qual[..], b"\n"] {
+            out.extend_from_slice(part);
+        }
+    }
+}
+
 /// One sampled read, or read pair.
 struct Fragment {
     rec: u64,    // record number in R1, from 1
     id: Vec<u8>, // empty unless read ids are written out
     seq: Vec<u8>,
     mate: Option<Vec<u8>>,
+    raw: Option<(Raw, Option<Raw>)>, // R1 and R2 id and qualities, for --depleted-out
+}
+
+/// What the reader keeps of each record, and how it samples.
+struct Sampling {
+    every: u64,
+    max_reads: Option<u64>,
+    keep_ids: bool,
+    keep_raw: bool,  // ids and qualities, for --depleted-out
+    decoders: usize, // threads inflating each BGZF file
 }
 
 /// Reads R1 (and R2 through a MateReader) and sends the sampled fragments in batches.
 /// Stops after `max_reads` fragments, or when the receiver is dropped.
 /// Returns the records read and whether it stopped before the end of the file.
-fn read_fragments(
-    r1: &str,
-    r2: Option<&str>,
-    every: u64,
-    max_reads: Option<u64>,
-    keep_ids: bool,
-    tx: SyncSender<Vec<Fragment>>,
-) -> Res<(u64, bool)> {
-    let mut reader = open(r1)?;
-    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every));
+fn read_fragments(r1: &str, r2: Option<&str>, sampling: Sampling, tx: SyncSender<Vec<Fragment>>) -> Res<(u64, bool)> {
+    let Sampling { every, max_reads, keep_ids, keep_raw, decoders } = sampling;
+    let mut reader = open(r1, decoders)?;
+    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every, keep_raw, decoders));
     let (mut n, mut sampled, mut stopped) = (0u64, 0u64, false);
     let mut batch = Vec::with_capacity(BATCH);
     while let Some(rec) = reader.next() {
@@ -177,12 +230,16 @@ fn read_fragments(
         if !(n - 1).is_multiple_of(every) {
             continue;
         }
-        let mate = match &mut mates {
-            Some(m) => Some(m.next()?),
-            None => None,
+        let (mate, mate_raw) = match &mut mates {
+            Some(m) => {
+                let (seq, raw) = m.next()?;
+                (Some(seq), raw)
+            }
+            None => (None, None),
         };
         let id = if keep_ids { rec.id().to_vec() } else { Vec::new() };
-        batch.push(Fragment { rec: n, id, seq: rec.seq().into_owned(), mate });
+        let raw = if keep_raw { Some((Raw::of(&rec, r1)?, mate_raw)) } else { None };
+        batch.push(Fragment { rec: n, id, seq: rec.seq().into_owned(), mate, raw });
         sampled += 1;
         if max_reads == Some(sampled) {
             stopped = true;
@@ -205,6 +262,46 @@ fn read_fragments(
         }
     }
     Ok((n, stopped))
+}
+
+/// The strict rule. The top organism is assigned when it has at least 2 marker hits,
+/// at least `min_frac` of the fragment's minimizers, and with its group's markers at
+/// least 90 % of all marker hits. The `min_frac` test scales with read length: a long
+/// host read can pick up 2 stray markers of another organism and none of its own.
+/// Otherwise a group is assigned when its markers and its members' pass the same tests.
+/// Returns the organism or group id and the hits that support it.
+fn call(hits: &[(usize, u32, u32)], genomes: usize, group_of: &[Option<usize>], minimizers: usize, min_frac: f64) -> Option<(usize, u32)> {
+    let total: u32 = hits.iter().map(|h| h.1).sum();
+    let ok = |own: u32, support: u32| own >= 2 && support * 10 >= total * 9 && own as f64 >= min_frac * minimizers as f64;
+    let count = |g: usize| hits.iter().find(|h| h.0 == g).map_or(0, |h| h.1);
+    if let Some(&(g, own, _)) = hits.iter().filter(|h| h.0 < genomes).max_by_key(|h| h.1) {
+        let support = own + group_of[g].map_or(0, count);
+        if ok(own, support) {
+            return Some((g, support));
+        }
+    }
+    let in_group = |id: usize, gr: usize| id == gr || id < genomes && group_of[id] == Some(gr);
+    let mut best: Option<(usize, u32)> = None;
+    for gr in hits.iter().filter_map(|h| if h.0 < genomes { group_of[h.0] } else { Some(h.0) }) {
+        let sum = hits.iter().filter(|h| in_group(h.0, gr)).map(|h| h.1).sum();
+        if best.is_none_or(|b| sum > b.1) {
+            best = Some((gr, sum));
+        }
+    }
+    best.filter(|&(_, sum)| ok(sum, sum))
+}
+
+/// Hit pattern of a `weak` or `conflict` fragment for EM: the organisms with enough
+/// evidence to have been assigned on their own count, ignoring the 90 % rule. Single hits
+/// are dropped (on real lanes they inflated trace organisms ~10x), and so are organisms
+/// below `min_frac` of the minimizers: otherwise EM would hand back the host reads with a
+/// few stray markers that `--min-frac` keeps out. Groups are left out: their markers say
+/// too little to split among organisms.
+fn em_pattern(hits: &[(usize, u32, u32)], genomes: usize, minimizers: usize, min_frac: f64) -> Vec<(usize, u32)> {
+    hits.iter()
+        .filter(|h| h.0 < genomes && h.1 >= 2 && h.1 as f64 >= min_frac * minimizers as f64)
+        .map(|h| (h.0, h.1))
+        .collect()
 }
 
 /// Index hits of one fragment.
@@ -241,9 +338,9 @@ type Scratch = (Vec<u64>, Vec<(usize, usize)>);
 
 fn classify(idx: &Index, seen: &[AtomicU64], f: &Fragment, (mins, ranges): &mut Scratch) -> Call {
     mins.clear();
-    minimizers(&f.seq, mins);
+    minimizers(&f.seq, idx.w, mins);
     if let Some(m) = &f.mate {
-        minimizers(m, mins);
+        minimizers(m, idx.w, mins);
     }
     mins.sort_unstable();
     mins.dedup();
@@ -381,6 +478,10 @@ pub struct Opts {
     pub reads_out: Option<String>,
     pub unmatched_out: Option<String>,
     pub unmatched_n: usize,
+    /// share of the fragment's minimizers the top organism must hit (0 = off)
+    pub min_frac: f64,
+    /// write the fragments not assigned to the host (or its group) to <prefix>[_R1/_R2].fastq.gz
+    pub depleted_out: Option<String>,
 }
 
 /// Fragments sampled before --precision may stop the scan.
@@ -389,9 +490,13 @@ const MIN_FOR_PRECISION: u64 = 10_000;
 /// Counts of one scanned sample.
 pub struct Report {
     pub host: Option<usize>,
+    /// the host's group: "host or a close relative", not contamination
+    pub host_group: Option<usize>,
     pub reads: Vec<u64>,    // fragments assigned per organism
     pub hits: Vec<u64>,     // marker k-mer hits per organism
     pub distinct: Vec<u64>, // different markers hit per organism
+    pub own_hits: Vec<u64>, // marker hits of each organism in its own assigned fragments
+    pub own_minimizers: Vec<u64>, // minimizers of those fragments
     pub special: [u64; 6],  // fragments per SPECIAL category
     pub sampled: u64,
     /// records in the file, or up to the last sampled one when stopped early
@@ -412,13 +517,18 @@ impl Report {
         wilson(x as f64 / self.sampled.max(1) as f64, self.sampled as f64 / self.design)
     }
 
+    /// Whether fragments of organism or group `g` count as host.
+    pub fn is_host(&self, g: usize) -> bool {
+        self.host == Some(g) || self.host_group == Some(g)
+    }
+
     /// Non-host fragments assigned by the strict rule (needs a host).
     pub fn contamination(&self) -> Option<u64> {
-        self.host.map(|h| self.reads.iter().sum::<u64>() - self.reads[h])
+        self.host.map(|_| (0..self.reads.len()).filter(|&g| !self.is_host(g)).map(|g| self.reads[g]).sum())
     }
 
     pub fn em_contamination(&self) -> Option<f64> {
-        self.host.map(|h| self.est.iter().sum::<f64>() - self.est[h])
+        self.host.map(|_| (0..self.est.len()).filter(|&g| !self.is_host(g)).map(|g| self.est[g]).sum())
     }
 
     pub fn write_tsv(&self, idx: &Index, out: &mut impl Write) -> Res<()> {
@@ -428,7 +538,7 @@ impl Report {
         };
         writeln!(
             out,
-            "category\treads\tpercent\tmarker_hits\tdistinct_markers\tindex_markers\tdiversity\tnote\tci95_low\tci95_high\tem_percent"
+            "category\treads\tpercent\tmarker_hits\tdistinct_markers\tindex_markers\tdiversity\tnote\tci95_low\tci95_high\tem_percent\tmarker_density\tidentity_est"
         )?;
         for g in 0..idx.names.len() {
             let div = diversity(self.hits[g], self.distinct[g], idx.markers[g]);
@@ -436,12 +546,18 @@ impl Report {
             if self.host == Some(g) {
                 note.push("host");
             }
+            if g >= idx.genomes {
+                note.push(if self.host_group == Some(g) { "group,host_group" } else { "group" });
+            }
             if self.hits[g] >= MIN_HITS_FOR_FLAG && div.is_some_and(|d| d < LOW_DIVERSITY) {
                 note.push("low_diversity");
             }
+            let dv = (g < idx.genomes)
+                .then(|| divergence(self.own_hits[g], self.own_minimizers[g], idx.unique_fraction(g)))
+                .flatten();
             writeln!(
                 out,
-                "{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+                "{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
                 idx.names[g],
                 self.reads[g],
                 self.pct(self.reads[g] as f64),
@@ -451,11 +567,13 @@ impl Report {
                 div.map_or(String::new(), |d| format!("{d:.3}")),
                 note.join(","),
                 ci(self.reads[g]),
-                self.pct(self.est[g])
+                self.pct(self.est[g]),
+                dv.map_or(String::new(), |d| format!("{:.3}", d.0)),
+                dv.map_or(String::new(), |d| format!("{:.4}", d.1))
             )?;
         }
         for (name, &x) in SPECIAL.iter().zip(&self.special) {
-            writeln!(out, "{name}\t{x}\t{:.4}\t\t\t\t\t\t{}\t", self.pct(x as f64), ci(x))?;
+            writeln!(out, "{name}\t{x}\t{:.4}\t\t\t\t\t\t{}\t\t\t", self.pct(x as f64), ci(x))?;
         }
         writeln!(out, "# total_fragments\t{}", self.total)?;
         if let Some(s) = self.stop {
@@ -463,6 +581,8 @@ impl Report {
         }
         writeln!(out, "# sampled_fragments\t{}", self.sampled)?;
         writeln!(out, "# duplicate_design_effect\t{:.3}", self.design)?;
+        // an organism with no fragment is below this, at 95 % (the CI's upper end for 0)
+        writeln!(out, "# absent_below_percent\t{:.4}", self.ci(0).1)?;
         writeln!(out, "# em_marker_error\t{:.6}", self.eps)?;
         if let (Some(c), Some(e)) = (self.contamination(), self.em_contamination()) {
             writeln!(out, "# contamination_percent\t{:.4}", self.pct(c as f64))?;
@@ -476,10 +596,10 @@ impl Report {
 pub fn host_id(idx: &Index, host: Option<&str>) -> Res<Option<usize>> {
     match host {
         Some(h) => Ok(Some(
-            idx.names
+            idx.names[..idx.genomes]
                 .iter()
                 .position(|n| n == h)
-                .ok_or_else(|| format!("host '{h}' is not in the index: {:?}", idx.names))?,
+                .ok_or_else(|| format!("host '{h}' is not an organism in the index: {:?}", &idx.names[..idx.genomes]))?,
         )),
         None => Ok(None),
     }
@@ -530,11 +650,88 @@ impl Reservoir {
     }
 }
 
+/// gzip writer of one FASTQ on its own thread, so compression runs beside classification.
+struct GzThread {
+    tx: SyncSender<Vec<u8>>,
+    thread: JoinHandle<Res<()>>,
+}
+
+impl GzThread {
+    fn start(path: String) -> Res<GzThread> {
+        let file = std::fs::File::create(&path).map_err(|e| format!("{path}: {e}"))?;
+        let (tx, rx) = sync_channel::<Vec<u8>>(4);
+        let thread = std::thread::spawn(move || -> Res<()> {
+            // level 1: output size matters less than keeping up with classification
+            let mut w = flate2::write::GzEncoder::new(std::io::BufWriter::new(file), flate2::Compression::fast());
+            for chunk in rx {
+                w.write_all(&chunk).map_err(|e| format!("{path}: {e}"))?;
+            }
+            w.finish()?.flush().map_err(|e| format!("{path}: {e}"))?;
+            Ok(())
+        });
+        Ok(GzThread { tx, thread })
+    }
+
+    fn send(&self, chunk: Vec<u8>) -> Res<()> {
+        // a failed send means the writer stopped on an error: finish() reports it
+        let _ = self.tx.send(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> Res<()> {
+        drop(self.tx);
+        self.thread.join().map_err(|_| "--depleted-out writer thread panicked")?
+    }
+}
+
+/// `--depleted-out`: the FASTQ of each batch is built in order, then handed to the writers.
+struct Depleted {
+    r1: Vec<u8>,
+    r2: Vec<u8>,
+    w1: GzThread,
+    w2: Option<GzThread>,
+}
+
+impl Depleted {
+    fn start(prefix: &str, paired: bool) -> Res<Depleted> {
+        let (w1, w2) = if paired {
+            (GzThread::start(format!("{prefix}_R1.fastq.gz"))?, Some(GzThread::start(format!("{prefix}_R2.fastq.gz"))?))
+        } else {
+            (GzThread::start(format!("{prefix}.fastq.gz"))?, None)
+        };
+        Ok(Depleted { r1: Vec::new(), r2: Vec::new(), w1, w2 })
+    }
+
+    fn flush_batch(&mut self) -> Res<()> {
+        self.w1.send(std::mem::take(&mut self.r1))?;
+        if let Some(w2) = &self.w2 {
+            w2.send(std::mem::take(&mut self.r2))?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Res<()> {
+        self.flush_batch()?;
+        self.w1.finish()?;
+        self.w2.map_or(Ok(()), GzThread::finish)
+    }
+}
+
 /// Classifies one sample (a file, or a read pair).
 pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: Option<&str>) -> Res<Report> {
     if opts.precision.is_some() && host.is_none() {
         return Err("--precision needs --host: it is the precision of the contamination percent".into());
     }
+    if opts.depleted_out.is_some()
+        && (host.is_none() || opts.every != 1 || opts.max_reads.is_some() || opts.precision.is_some())
+    {
+        return Err("--depleted-out needs --host and --every 1, without --max-reads or --precision: it writes every non-host read".into());
+    }
+    let mut depleted = match &opts.depleted_out {
+        Some(prefix) => Some(Depleted::start(prefix, r2.is_some())?),
+        None => None,
+    };
+    let host_group = host.and_then(|h| idx.group_of[h]);
     let mut dump = match &opts.reads_out {
         Some(p) => {
             let f = std::fs::File::create(p).map_err(|e| format!("{p}: {e}"))?;
@@ -548,6 +745,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     let mut reads = vec![0u64; n_org];
     let mut hits = vec![0u64; n_org];
     let mut distinct = vec![0u64; n_org];
+    let (mut own_hits, mut own_minimizers) = (vec![0u64; n_org], vec![0u64; n_org]);
     let mut special = [0u64; 6];
     let mut sampled = 0u64;
     let seen: Vec<AtomicU64> = (0..idx.len() / 64 + 1).map(|_| AtomicU64::new(0)).collect(); // one bit per index entry
@@ -562,8 +760,10 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     // the pool classifies a batch while the reader decompresses the next ones.
     let (tx, rx) = sync_channel::<Vec<Fragment>>(4);
     let keep_ids = dump.is_some() || opts.unmatched_out.is_some();
+    let keep_raw = depleted.is_some();
     let (r1s, r2s, every, max_reads) = (r1.to_string(), r2.map(str::to_string), opts.every, opts.max_reads);
-    let reader = std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), every, max_reads, keep_ids, tx));
+    let sampling = Sampling { every, max_reads, keep_ids, keep_raw, decoders: decoders(opts.threads) };
+    let reader = std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), sampling, tx));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(opts.threads).build()?;
     for batch in rx {
         let calls: Vec<Call> =
@@ -581,16 +781,26 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 hits[g] += h as u64;
                 distinct[g] += d as u64;
             }
-            let category = match c.hits.iter().max_by_key(|h| h.1) {
-                Some(&(g, best, _)) if best >= 2 && best * 10 >= total * 9 => {
+            let decision = call(&c.hits, idx.genomes, &idx.group_of, c.minimizers, opts.min_frac);
+            if let (Some(d), Some((raw1, raw2))) = (&mut depleted, &f.raw) {
+                if !decision.is_some_and(|(g, _)| Some(g) == host || Some(g) == host_group) {
+                    raw1.fastq(&f.seq, &mut d.r1);
+                    if let (Some(raw2), Some(seq2)) = (raw2, &f.mate) {
+                        raw2.fastq(seq2, &mut d.r2);
+                    }
+                }
+            }
+            let category = match decision {
+                Some((g, support)) => {
                     reads[g] += 1;
+                    own_hits[g] += c.hits.iter().find(|h| h.0 == g).map_or(0, |h| h.1) as u64;
+                    own_minimizers[g] += c.minimizers as u64;
                     assigned_hits += total as u64;
-                    off_target += (total - best) as u64;
+                    off_target += (total - support) as u64;
                     idx.names[g].as_str()
                 }
-                Some(_) => {
-                    // single hits are dropped: on real lanes they inflated trace organisms ~10x
-                    let pattern: Vec<(usize, u32)> = c.hits.iter().filter(|h| h.1 >= 2).map(|h| (h.0, h.1)).collect();
+                None if !c.hits.is_empty() => {
+                    let pattern = em_pattern(&c.hits, idx.genomes, c.minimizers, opts.min_frac);
                     if !pattern.is_empty() {
                         *ambiguous.entry(pattern).or_default() += 1;
                     }
@@ -629,8 +839,11 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
                 )?;
             }
         }
+        if let Some(d) = &mut depleted {
+            d.flush_batch()?;
+        }
         if let (Some(p), Some(h)) = (opts.precision, host) {
-            let contam = reads.iter().sum::<u64>() - reads[h];
+            let contam: u64 = (0..n_org).filter(|&g| g != h && Some(g) != host_group).map(|g| reads[g]).sum();
             let (lo, hi) = wilson(contam as f64 / sampled as f64, sampled as f64 / dups.design_effect());
             if sampled >= MIN_FOR_PRECISION && (hi - lo) / 2.0 <= p {
                 precision_stop = true;
@@ -639,6 +852,9 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
         }
     }
     let (n, reader_stopped) = reader.join().map_err(|_| "R1 reader thread panicked")??;
+    if let Some(d) = depleted {
+        d.finish()?;
+    }
     if let Some(w) = &mut dump {
         w.flush()?;
     }
@@ -658,9 +874,12 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     };
     Ok(Report {
         host,
+        host_group,
         reads,
         hits,
         distinct,
+        own_hits,
+        own_minimizers,
         special,
         sampled,
         total: if stop.is_some() { last_rec } else { n },
@@ -724,6 +943,41 @@ mod tests {
             d.add(crate::kmer::mix(k / 3)); // clusters of 3
         }
         assert!(d.shift > 0 && (d.design_effect() - 3.0).abs() < 0.01, "{}", d.design_effect());
+    }
+
+    #[test]
+    fn min_frac_scales_with_minimizers() {
+        use super::call;
+        let one = |best: u32, total: u32, minz: usize, f: f64| {
+            let hits = if best == total { vec![(0, best, 0)] } else { vec![(0, best, 0), (1, total - best, 0)] };
+            call(&hits, 2, &[None, None], minz, f).is_some()
+        };
+        assert!(one(2, 2, 40, 0.0));
+        assert!(!one(2, 2, 40, 0.1), "2 of 40 minimizers is below 10 %");
+        assert!(one(4, 4, 40, 0.1));
+        assert!(!one(1, 1, 5, 0.0) && !one(8, 10, 40, 0.0), "2-hit and 90 % rules still apply");
+    }
+
+    #[test]
+    fn em_pattern_needs_min_frac() {
+        use super::em_pattern;
+        let hits = [(0, 2, 0), (1, 6, 0), (2, 1, 0), (3, 9, 0)]; // 3 is a group
+        assert_eq!(em_pattern(&hits, 3, 40, 0.0), vec![(0, 2), (1, 6)], "as before at 0");
+        assert_eq!(em_pattern(&hits, 3, 40, 0.15), vec![(1, 6)], "2 of 40 is below 15 %");
+        assert!(em_pattern(&hits, 3, 100, 0.15).is_empty());
+    }
+
+    #[test]
+    fn groups_take_reads_their_members_share() {
+        use super::call;
+        // organisms 0 and 1 in group 3, organism 2 alone
+        let group_of = [Some(3), Some(3), None];
+        let c = |hits: &[(usize, u32, u32)]| call(hits, 3, &group_of, 20, 0.0);
+        assert_eq!(c(&[(0, 5, 0), (3, 10, 0)]), Some((0, 15)), "group markers back their member");
+        assert_eq!(c(&[(0, 3, 0), (1, 3, 0), (3, 10, 0)]), Some((3, 16)), "both members: the group");
+        assert_eq!(c(&[(3, 6, 0)]), Some((3, 6)), "group markers only");
+        assert_eq!(c(&[(2, 6, 0), (3, 6, 0)]), None, "group against an outsider: conflict");
+        assert_eq!(c(&[(3, 1, 0)]), None, "one hit is too little");
     }
 
     #[test]

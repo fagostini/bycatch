@@ -26,11 +26,24 @@ ecoli	data/ecoli.fa
 phix	data/phix.fa
 ```
 
+An optional third column puts organisms in a **group**, such as a genus:
+`cod<TAB>cod.fa.gz<TAB>Gadus`. A k-mer found only in genomes of one group then goes to
+that group instead of `shared`, and reads it explains get a group row in the report (see
+"Deciding the read's category"). No taxonomy is needed. Without a third column nothing
+changes, and the index is identical to one built before groups existed.
+
 Build the index (writes `idx.kmers`, `idx.table` and `idx.meta`):
 
 ```bash
 target/release/bycatch build genomes.tsv --out idx --jobs 4
 ```
+
+`--window W` (5–31, default 15) sets the minimizer window. A smaller window keeps more
+k-mers, about 2 / (W + 1) of them, so short reads get more chances to hit: useful for
+2×50 data, at the cost of a larger index (W = 7 roughly doubles it). The index records its
+window, and scans and `add` use it. On simulated 2×50 cod-host sets, `--window 11` cut
+unassigned host reads from 19 % to 13 % and raised macro F1 by 0.01–0.03, for a 30 %
+larger index (COMPARISON.md, "Post-hoc: minimizer window"). Longer reads gain nothing.
 
 Scan a single-end file, a read pair, or stdin (`-`):
 
@@ -45,9 +58,11 @@ target/release/bycatch scan -i idx --host fish sample_R1.fastq.gz sample_R2.fast
 | `--every N` | classify 1 read (or pair) in N, default 50; `--every 1` classifies all |
 | `--max-reads M` | stop after classifying M reads (or pairs), or at the end of the file if that comes first |
 | `--precision P` | stop once the contamination 95 % CI is within ± P percentage points (needs `--host`; checked every 4,096 fragments, from 10,000 on) |
+| `--min-frac F` | the top organism must also hit at least this share of the fragment's minimizers, default 0.15; 0 turns it off; see below |
 | `-t, --threads T` | threads classifying reads, default 4 (plus one reading R1 and one reading R2) |
 | `--reads FILE` | also write one line per classified read |
 | `--unmatched-out FILE` | write a random sample of `unmatched` fragments as FASTA, for BLAST or sylph |
+| `--depleted-out PREFIX` | write every read (or pair) not assigned to the host or its group to `PREFIX_R1.fastq.gz` / `PREFIX_R2.fastq.gz` (`PREFIX.fastq.gz` single-end), in input order; needs `--host` and `--every 1` |
 | `--unmatched-n N` | fragments in `--unmatched-out`, default 1000 |
 | `--mqc PREFIX` | write MultiQC files `PREFIX_bycatch_mqc.tsv` and `PREFIX_bycatch_stats_mqc.tsv` |
 | `--name NAME` | sample name in the MultiQC files, default from the R1 file name |
@@ -118,10 +133,21 @@ target/release/bycatch add -i idx new_genomes.tsv --out idx2
 ```
 
 Reads only the new genomes and merges them into a copy of the index: their k-mers that
-are markers of an old organism, or already shared, become `shared`. The result is
+are markers of an old organism, or already shared, become `shared` (or their group's, if
+both organisms are in one group). The result is
 byte-identical to building from the old list followed by the new one (tested), and takes
 the time of reading the new genomes plus one pass over the old index. The old index is
-kept; `--out` must differ from it. Up to 255 organisms in all.
+kept; `--out` must differ from it. Up to 1023 organisms and groups in all.
+
+### Looking inside an index
+
+```bash
+target/release/bycatch info -i idx
+```
+
+Prints the format, k, w, entry size, id and prefix bits, number of entries and size on
+disk, then one row per organism (minimizers, unique markers, unique fraction, group) and
+one per group (unique markers, members).
 
 ### Shrinking an index built before the id-sized layout
 
@@ -195,8 +221,10 @@ run in order). For each distinct k-mer:
 
 - found in **one** genome: entry `kmer | organism_id`. This is a **marker** of
   that organism.
-- found in **two or more** genomes: one entry `kmer | all-ones id`, the **shared** tag
-  (255 with 8 id bits; section 6 says how many id bits an index uses).
+- found in **two or more** genomes of **one group**: entry `kmer | group_id`, a marker
+  of that group. Group ids follow the organism ids.
+- found in **two or more** genomes otherwise: one entry `kmer | all-ones id`, the
+  **shared** tag (255 with 8 id bits; section 6 says how many id bits an index uses).
 
 Shared entries are kept rather than deleted, so the scan can tell "sequence common to
 several references" apart from "sequence in none".
@@ -222,6 +250,10 @@ table stores where each group starts.
 - **Smaller indexes**: P is chosen so there are about 8 entries per prefix, and entries
   keep the full k-mer: `kmer << 8 | id`, **8 bytes**. The table is about 1/16 of the
   entries' size and only speeds up lookups.
+- **Over 255 organisms and groups**: the compact table would need 2³¹ slots or more
+  (8 GB), so entries keep the full k-mer with I = 9 or 10 id bits, `kmer << I | id`,
+  **8 bytes**, plus the small table. Up to 1023 organisms and groups. Such an index takes
+  about twice the bytes per entry of a compact one. Indexes up to 255 are unchanged.
 
 Offsets are stored as 32-bit values plus one 64-bit base per block of 2¹⁶ prefixes, so
 indexes with more than 2³² entries still work with a 4 GB table.
@@ -280,6 +312,9 @@ that genome, and host reads with read-through became `conflict`.
   A full scan of one lane took 966 s from there and 37.6 s from `/var/tmp`; with the
   index and the input warm in page cache, 3.3 s today (see PERFORMANCE.md).
   FASTQ input is read once, front to back, so it can stay in the encrypted home.
+- BGZF input (blocked gzip, bcl-convert's default) is inflated in parallel: batches of
+  256 blocks on a quarter of `--threads` (1 to 4) per file, each block checked against its
+  CRC32. Plain gzip, plain text and stdin are read as one stream.
 - R1 is read in full on its own thread. Only record 1, 1 + N, 1 + 2N, … is classified
   (`--every N`); the rest is decompressed and skipped. Taking every Nth read, not the
   first reads, means every part of the run (all tiles, all of the file) is represented.
@@ -313,12 +348,13 @@ For a sampled read (or pair):
 
 | Condition | Category |
 |---|---|
-| no hit, but an adapter 27-mer anywhere in the read or mate | `adapter` |
+| no hit, but an adapter 17-mer anywhere in the read or mate | `adapter` |
 | no hit and no minimizer at all (poly-G, simple repeats, shorter than 27 bp) | `low_complexity` |
 | no hit otherwise | `unmatched` |
 | only `shared` hits | `shared` |
-| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits | that organism |
-| markers of one organism only, but just 1 hit | `weak` |
+| top organism has **≥ 2** marker hits **and ≥ 90 %** of all marker hits **and** hits at least `--min-frac` (default 15 %) of the fragment's minimizers; its group's markers count with it toward the 90 % | that organism |
+| otherwise, a group's markers plus its members' pass the same three tests | that group |
+| markers of one organism only, but too few hits for the rule above | `weak` |
 | anything else (markers of several organisms) | `conflict` |
 
 Shared hits never vote. Two hits are required because one k-mer can match by chance or
@@ -326,6 +362,15 @@ through a single sequencing error. The 90 % rule tolerates an odd marker from an
 organism (an error creating a k-mer that exists elsewhere) without letting a chimera be
 assigned. The same rule works for long reads: they lose k-mers to errors but have
 hundreds of minimizers.
+
+The 2-hit floor does not grow with read length. A 2×150 host read has ~25 minimizers,
+and about 3 in 10,000 hit 2 stray markers of another organism and no host marker. Their
+other minimizers match nothing, or only `shared` k-mers, so the 90 % rule does not stop
+them. `--min-frac` also asks for a share of the fragment's minimizers, as Kraken2's
+`--confidence` does. On simulated cod reads those false calls hit a median 11–18 % of
+their minimizers, and true contaminant reads 83–88 %. The default 0.15 was picked on one
+simulated set and checked on fresh ones (COMPARISON.md, "Post-hoc"). `--min-frac 0` gives
+the rule of earlier versions.
 
 The result is a fraction of **fragments**. A 3 Gb genome does not count more than a
 5 Mb genome because it has more k-mers; each read is judged on its own.
@@ -351,8 +396,10 @@ note `low_diversity`. Heavy PCR duplication can also cause it, so the note means
 
 ### 5. Report
 
-TSV on stdout. One row per organism, in index order, then `shared`, `weak`, `conflict`,
-`adapter`, `low_complexity` and `unmatched`.
+TSV on stdout. One row per organism, in index order, then one per group (note `group`),
+then `shared`, `weak`, `conflict`, `adapter`, `low_complexity` and `unmatched`. The host's
+group (note `group,host_group`) is "host or a close relative": it does not count as
+contamination. The EM estimate splits `weak` and `conflict` reads among organisms only.
 
 `adapter` looks for every 17-mer (not only minimizers) of reads with no other hit in a
 built-in list: Illumina TruSeq read 1 and 2 and the P5 side, Nextera read 1 and 2 and the
@@ -368,9 +415,11 @@ must leave at least 17 adapter bases in the read (insert ≤ 133 bp for 150 bp r
 | `distinct_markers` | different markers hit |
 | `index_markers` | unique markers of the organism in the index |
 | `diversity` | see above |
-| `note` | `host` and/or `low_diversity` |
+| `note` | `host`, `group`, `host_group` and/or `low_diversity` |
 | `ci95_low`, `ci95_high` | 95 % Wilson score interval of `percent` (all rows) |
 | `em_percent` | `percent` after the EM step below (organism rows only) |
+| `marker_density` | marker hits per minimizer in the organism's assigned fragments, divided by its unique fraction (what reads copied from its reference would give): about 1 for reads of the reference, lower for a diverged strain or relative (organisms with ≥ 20 such hits) |
+| `identity_est` | `marker_density`^(1/27): a rough per-base identity. Sequencing errors lower it too, so compare samples rather than read it as an ANI |
 
 The interval covers sampling noise only (`--every N`), not classification bias such as
 genome reads lost to `shared`. With 0 reads its upper end, about 3/n, is the most an
@@ -389,8 +438,9 @@ first 32 bases split a cluster, so D is a slight underestimate.
 proportion to abundance, as Bracken does for Kraken. Each marker hit of a fragment from
 organism g is taken to be a marker of g with probability 1 − ε, else of another organism;
 ε is the share of off-target hits among strictly assigned fragments (clamped to
-0.0001–0.5). Only organisms with at least 2 hits in the fragment are candidates, so 1-hit
-`weak` reads stay unassigned; `shared` and `unmatched` fragments are not moved. On
+0.0001–0.5). Only organisms with at least 2 hits in the fragment, and at least
+`--min-frac` of its minimizers, are candidates, so 1-hit `weak` reads and host reads with a
+few stray markers stay unassigned; `shared` and `unmatched` fragments are not moved. On
 simulated 150 nt reads (10 genomes) it cut the largest error from −0.13 to −0.07
 percentage points. On a real cod lane it raised every trace organism about 1.6×; there
 is no truth to tell whether that is closer. Without the 2-hit filter it raised them up to
@@ -404,6 +454,9 @@ Trailing lines:
 - `# stopped_at_precision`: only when `--precision` ended the scan;
 - `# sampled_fragments`: reads (or pairs) classified;
 - `# duplicate_design_effect`: D above;
+- `# absent_below_percent`: the upper end of the 95 % interval for 0 fragments. An organism
+  with none is below this share; it is the smallest level a zero rules out, set by the
+  number of fragments sampled and D;
 - `# em_marker_error`: the ε used by the EM step;
 - `# contamination_percent`: only with `--host`; non-host assigned fragments divided by
   sampled fragments. The special categories are not counted as contamination;
@@ -417,6 +470,13 @@ One line per classified fragment:
 `unique_hits` lists the organisms hit, such as `fish:14,mouse:1`. The sequence is the R1 sequence.
 Useful to check odd calls, for example by BLAST.
 
+`--depleted-out PREFIX` writes every fragment not assigned to the host or its group, as
+gzipped FASTQ with the original ids and qualities, in input order: organisms, groups,
+`shared`, `weak`, `conflict`, `adapter`, `low_complexity` and `unmatched` reads are all
+kept, so a host read that hits only `shared` k-mers stays in. It needs FASTQ input,
+`--host` and `--every 1`. Compression (gzip level 1) runs on one thread per file next to
+classification.
+
 `--unmatched-out FILE` writes `--unmatched-n` fragments drawn at random from all
 `unmatched` ones (reservoir sampling with a fixed seed, so the same input gives the same
 file). Ids are cut at the first space; pairs are written as `id/1` and `id/2`. BLAST them,
@@ -426,12 +486,13 @@ or run sylph against GTDB, to find organisms missing from the index.
 
 | File | Content |
 |---|---|
+| `src/bgzf.rs` | parallel BGZF reader |
 | `src/kmer.rs` | 2-bit encoding, canonical k-mers, hash, low-complexity filter, minimizers |
-| `src/index.rs` | build, add and repack (per-genome runs, merge, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
-| `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, duplicates, Wilson intervals, EM, `--precision`, report |
+| `src/index.rs` | build, add and repack (per-genome runs, merge, groups, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
+| `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, groups, duplicates, Wilson intervals, EM, `--precision`, report, `--depleted-out` |
 | `src/run.rs` | `run`: many samples, matrix, background / elevated / index-hopping flags, MultiQC files |
 | `src/main.rs` | command line |
-| `tests/synthetic.rs` | end-to-end test on three random genomes sharing a block: scan, threads, adapters, `--precision`, `add`, `run`, MultiQC |
+| `tests/synthetic.rs` | end-to-end test on three random genomes sharing a block: scan, threads, adapters, `--precision`, `add`, `run`, MultiQC; groups, over 255 organisms, `--depleted-out` |
 
 ```bash
 cargo test --release

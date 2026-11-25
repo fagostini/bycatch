@@ -1,3 +1,4 @@
+mod bgzf;
 mod index;
 mod kmer;
 mod run;
@@ -19,6 +20,10 @@ enum Cmd {
         /// Genomes read at once. Each needs about 1-2 GB of RAM per Gb of genome
         #[arg(short, long, default_value_t = 4)]
         jobs: usize,
+        /// Minimizer window in k-mers (5-31): smaller keeps more k-mers, for short reads,
+        /// at the cost of a larger index (density about 2 / (w + 1))
+        #[arg(long, default_value_t = kmer::W)]
+        window: usize,
     },
     /// Add genomes (TSV of `name<TAB>fasta_path`) to an index, without reading its genomes again
     Add {
@@ -32,6 +37,12 @@ enum Cmd {
         /// Genomes read at once
         #[arg(short, long, default_value_t = 4)]
         jobs: usize,
+    },
+    /// Print an index's layout, organisms (with unique markers) and groups
+    Info {
+        /// Index prefix
+        #[arg(short, long)]
+        index: String,
     },
     /// Rewrite an index in the current, smaller layout; results stay the same
     Repack {
@@ -52,6 +63,10 @@ enum Cmd {
         /// Write a random sample of unmatched fragments to this FASTA (for BLAST, sylph...)
         #[arg(long)]
         unmatched_out: Option<String>,
+        /// Write the reads not assigned to the host (or its group) to PREFIX_R1/_R2.fastq.gz
+        /// (PREFIX.fastq.gz for single-end); needs --host and --every 1
+        #[arg(long, value_name = "PREFIX")]
+        depleted_out: Option<String>,
         /// Fragments in --unmatched-out
         #[arg(long, default_value_t = 1000)]
         unmatched_n: usize,
@@ -96,6 +111,9 @@ struct Common {
     /// Stop once the contamination 95 % CI is within ± this many percentage points (needs --host)
     #[arg(long)]
     precision: Option<f64>,
+    /// Share of a fragment's minimizers the top organism must hit to be assigned (0 = off)
+    #[arg(long, default_value_t = 0.15, value_parser = unit_fraction)]
+    min_frac: f64,
     /// Threads classifying reads (plus one reading R1 and one reading R2)
     #[arg(short = 't', long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..))]
     threads: u64,
@@ -111,7 +129,16 @@ impl Common {
             reads_out: None,
             unmatched_out: None,
             unmatched_n: 0,
+            min_frac: self.min_frac,
+            depleted_out: None,
         }
+    }
+}
+
+fn unit_fraction(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(f) if (0.0..=1.0).contains(&f) => Ok(f),
+        _ => Err(format!("{s} is not a number from 0 to 1")),
     }
 }
 
@@ -126,11 +153,12 @@ fn sample_name(path: &str) -> String {
 
 fn main() {
     let result = match Cmd::parse() {
-        Cmd::Build { genomes, out, jobs } => index::build(&genomes, &out, jobs),
+        Cmd::Build { genomes, out, jobs, window } => index::build(&genomes, &out, jobs, window),
         Cmd::Add { index, genomes, out, jobs } => index::add(&index, &genomes, &out, jobs),
         Cmd::Repack { index, out } => index::repack(&index, &out),
-        Cmd::Scan { common, reads, unmatched_out, unmatched_n, mqc, name, r1, r2 } => {
-            let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, ..common.opts() };
+        Cmd::Info { index } => index::info(&index),
+        Cmd::Scan { common, reads, unmatched_out, unmatched_n, depleted_out, mqc, name, r1, r2 } => {
+            let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, depleted_out, ..common.opts() };
             let name = name.unwrap_or_else(|| sample_name(&r1));
             index::Index::load(&common.index).and_then(|idx| {
                 let mqc = mqc.as_deref().map(|m| (m, name.as_str()));

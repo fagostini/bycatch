@@ -5,8 +5,13 @@
 //! entries: the id takes as few bits as the organism count needs (7 for 95 organisms)
 //! and the rest of the k-mer goes in the table, `22 + id_bits` prefix bits (2^29 slots,
 //! 2 GB, for 7 id bits). Smaller indexes keep 8-byte entries with the full k-mer, 8 id
-//! bits and a small table that only speeds up lookups.
-use crate::kmer::{kmers_at, minimizers, K, W};
+//! bits and a small table that only speeds up lookups. Over 255 ids (organisms plus
+//! groups) the compact table would be 8 GB or more, so 8-byte entries are used with up to
+//! 10 id bits.
+//!
+//! Ids: organisms first, then groups (optional third column of the genome list), then
+//! the all-ones id for k-mers shared outside one group.
+use crate::kmer::{kmers_at, minimizers, K, W_RANGE};
 use crate::scan::{adapter_kmers, ADAPTER_K};
 use crate::Res;
 use rayon::prelude::*;
@@ -16,8 +21,12 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Id of a k-mer found in more than one genome. Never evidence for any organism.
-pub const SHARED: u8 = 255;
+/// Id of a k-mer found in more than one genome, outside a single group. Never evidence
+/// for any organism.
+pub const SHARED: u16 = u16::MAX;
+/// Organisms plus groups: 10 id bits next to a 54-bit k-mer fill a 64-bit entry, and
+/// the all-ones id is `shared`.
+pub const MAX_IDS: usize = 1023;
 
 const KMER_BITS: u32 = 2 * K as u32;
 /// k-mer bits that do not fit a 4-byte entry with no id: the least prefix bits.
@@ -27,17 +36,76 @@ const COMPACT_MAX_PREFIX_BITS: u32 = COMPACT_BASE_BITS + 8;
 /// The table stores offsets as u32, plus one u64 base per block of 2^16 prefixes.
 const BLOCK_BITS: u32 = 16;
 
-/// Prefix bits, entry size and id bits for an index of about `n` entries of `organisms`.
-fn layout(n: u64, organisms: usize) -> (u32, usize, u32) {
-    // ids 0..organisms, plus the all-ones id for shared k-mers
-    let id_bits = usize::BITS - organisms.leading_zeros();
+/// Prefix bits, entry size and id bits for an index of about `n` entries and `ids`
+/// organisms plus groups.
+fn layout(n: u64, ids: usize) -> (u32, usize, u32) {
+    // ids 0..ids, plus the all-ones id for shared k-mers
+    let id_bits = usize::BITS - ids.leading_zeros();
     let prefix_bits = COMPACT_BASE_BITS + id_bits;
-    if n >= 1 << prefix_bits {
+    // about 8 entries per prefix: table is 1/16 of the entries' size
+    let small_table = (63 - n.max(16).leading_zeros()) - 3;
+    if id_bits > 8 {
+        // the compact table would need 2^31 slots or more
+        (small_table, 8, id_bits)
+    } else if n >= 1 << prefix_bits {
         // table (4 bytes per prefix) + 4 bytes per entry is no larger than 8 bytes per entry from here on
         (prefix_bits, 4, id_bits)
     } else {
-        // about 8 entries per prefix: table is 1/16 of the entries' size
-        ((63 - n.max(16).leading_zeros()) - 3, 8, 8)
+        (small_table, 8, 8)
+    }
+}
+
+/// Organisms (ids 0..genomes) and groups (ids genomes..), with the group of each organism.
+struct Labels {
+    names: Vec<String>,
+    genomes: usize,
+    group_of: Vec<Option<usize>>, // per organism: id of its group
+}
+
+impl Labels {
+    /// `genomes`: (name, group) in id order. Groups get ids in order of first appearance.
+    fn new(genomes: &[(String, Option<String>)]) -> Res<Labels> {
+        let mut names: Vec<String> = genomes.iter().map(|g| g.0.clone()).collect();
+        let n = names.len();
+        let mut group_of = Vec::with_capacity(n);
+        for (_, group) in genomes {
+            group_of.push(match group {
+                None => None,
+                Some(gr) => {
+                    if names[..n].contains(gr) {
+                        return Err(format!("group '{gr}' has the name of an organism").into());
+                    }
+                    Some(match names[n..].iter().position(|x| x == gr) {
+                        Some(i) => n + i,
+                        None => {
+                            names.push(gr.clone());
+                            names.len() - 1
+                        }
+                    })
+                }
+            });
+        }
+        if names.len() > MAX_IDS {
+            return Err(format!("{n} organisms and {} groups: at most {MAX_IDS} in all", names.len() - n).into());
+        }
+        Ok(Labels { names, genomes: n, group_of })
+    }
+
+    /// Group id of an organism or group id, None for `shared` or an ungrouped organism.
+    fn group(&self, id: u16) -> Option<usize> {
+        match id as usize {
+            _ if id == SHARED => None,
+            g if g < self.genomes => self.group_of[g],
+            g => Some(g),
+        }
+    }
+
+    /// Id of a k-mer held by both `a` and `b` (organisms, groups or `shared`).
+    fn combine(&self, a: u16, b: u16) -> u16 {
+        match (self.group(a), self.group(b)) {
+            (Some(x), Some(y)) if x == y => x as u16,
+            _ => SHARED,
+        }
     }
 }
 
@@ -63,15 +131,15 @@ fn mask_adapters(seq: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Sorted, deduplicated minimizers of one genome, written raw to `tmp`. Returns their number.
-fn genome_run(path: &str, tmp: &str) -> Res<u64> {
+fn genome_run(path: &str, tmp: &str, w: usize) -> Res<u64> {
     let mut reader = needletail::parse_fastx_file(path).map_err(|e| format!("{path}: {e}"))?;
     let mut v = Vec::new();
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| format!("{path}: {e}"))?;
         let seq = rec.seq();
         match mask_adapters(&seq) {
-            Some(masked) => minimizers(&masked, &mut v),
-            None => minimizers(&seq, &mut v),
+            Some(masked) => minimizers(&masked, w, &mut v),
+            None => minimizers(&seq, w, &mut v),
         }
     }
     v.par_sort_unstable();
@@ -89,36 +157,48 @@ fn next_u64(r: &mut impl Read) -> Res<Option<u64>> {
     }
 }
 
-/// TSV of `name<TAB>fasta_path`; blank lines and `#` lines are skipped.
-fn read_list(list: &str, text: &str) -> Res<Vec<(String, String)>> {
-    let mut genomes: Vec<(String, String)> = Vec::new();
+/// One line of a genome list: name, FASTA path, optional group.
+type Genome = (String, String, Option<String>);
+
+/// TSV of `name<TAB>fasta_path[<TAB>group]`; blank lines and `#` lines are skipped.
+fn read_list(list: &str, text: &str) -> Res<Vec<Genome>> {
+    let mut genomes: Vec<Genome> = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
-        let (name, path) = line
-            .split_once('\t')
-            .ok_or_else(|| format!("{list}: expected name<TAB>path, got '{line}'"))?;
-        if genomes.iter().any(|(n, _)| n == name) {
+        let f: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let (name, path, group) = match f[..] {
+            [n, p] => (n, p, None),
+            [n, p, g] if !g.is_empty() => (n, p, Some(g.to_string())),
+            [n, p, _] => (n, p, None),
+            _ => return Err(format!("{list}: expected name<TAB>path[<TAB>group], got '{line}'").into()),
+        };
+        if genomes.iter().any(|(n, _, _)| n == name) {
             return Err(format!("{list}: duplicate organism name '{name}'").into());
         }
-        genomes.push((name.to_string(), path.trim().to_string()));
+        genomes.push((name.to_string(), path.to_string(), group));
     }
     Ok(genomes)
 }
 
-/// `list`: TSV of `name<TAB>fasta_path`. Writes `<out>.kmers` and `<out>.meta`.
+/// `list`: TSV of `name<TAB>fasta_path[<TAB>group]`. Writes `<out>.kmers` and `<out>.meta`.
 /// At most `jobs` genomes are held in memory at once; the rest goes through
 /// temporary files `<out>.tmpN`, so memory does not grow with the number of genomes.
-pub fn build(list: &str, out: &str, jobs: usize) -> Res<()> {
+/// `w`: minimizer window, recorded in the index; scans use the same.
+pub fn build(list: &str, out: &str, jobs: usize, w: usize) -> Res<()> {
+    if !W_RANGE.contains(&w) {
+        return Err(format!("--window must be {} to {}, got {w}", W_RANGE.start(), W_RANGE.end()).into());
+    }
     let text = fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
     let genomes = read_list(list, &text)?;
     let n = genomes.len();
-    if n == 0 || n > SHARED as usize {
-        return Err(format!("{list}: need 1 to 255 genomes, got {n}").into());
+    if n == 0 {
+        return Err(format!("{list}: no genomes").into());
     }
+    let labels = Labels::new(&genomes.iter().map(|g| (g.0.clone(), g.2.clone())).collect::<Vec<_>>())
+        .map_err(|e| format!("{list}: {e}"))?;
     let tmp: Vec<String> = (0..n).map(|g| format!("{out}.tmp{g}")).collect();
-    let result = build_runs(&genomes, &tmp, jobs).and_then(|totals| {
+    let result = build_runs(&genomes, &tmp, jobs, w).and_then(|totals| {
         let sources = run_sources(&tmp, 0)?;
-        let names: Vec<&str> = genomes.iter().map(|g| g.0.as_str()).collect();
-        merge(sources, &names, &totals, out)
+        merge(sources, &labels, &totals, w, out)
     });
     for t in &tmp {
         let _ = fs::remove_file(t);
@@ -129,7 +209,7 @@ pub fn build(list: &str, out: &str, jobs: usize) -> Res<()> {
 /// Adds genomes to an existing index without reading its genomes again. Writes a new
 /// index at `out`; the old one is left as it is. The result is the same as building
 /// from the old list followed by the new one: a new genome's k-mer that is a marker of
-/// an old organism, or already shared, becomes shared.
+/// an old organism, or already shared, becomes shared, unless both are in one group.
 pub fn add(old: &str, list: &str, out: &str, jobs: usize) -> Res<()> {
     if old == out {
         return Err("add: --out must differ from the old index, which is read while the new one is written".into());
@@ -137,20 +217,33 @@ pub fn add(old: &str, list: &str, out: &str, jobs: usize) -> Res<()> {
     let idx = Index::load(old)?;
     let text = fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
     let genomes = read_list(list, &text)?;
-    if let Some((name, _)) = genomes.iter().find(|(n, _)| idx.names.contains(n)) {
+    if let Some((name, _, _)) = genomes.iter().find(|(n, _, _)| idx.names.contains(n)) {
         return Err(format!("{list}: '{name}' is already in {old}").into());
     }
-    let n = idx.names.len() + genomes.len();
-    if genomes.is_empty() || n > SHARED as usize {
-        return Err(format!("{list}: need 1 or more genomes and at most 255 in all, got {n}").into());
+    if genomes.is_empty() {
+        return Err(format!("{list}: no genomes").into());
     }
+    // old organisms keep their ids; old groups move up by the number of new organisms
+    let all: Vec<(String, Option<String>)> = (0..idx.genomes)
+        .map(|g| (idx.names[g].clone(), idx.group_of[g].map(|x| idx.names[x].clone())))
+        .chain(genomes.iter().map(|g| (g.0.clone(), g.2.clone())))
+        .collect();
+    let labels = Labels::new(&all).map_err(|e| format!("{list}: {e}"))?;
+    // groups of the old index that no new genome names keep their name: add them in old order
+    let mut labels = labels;
+    for name in &idx.names[idx.genomes..] {
+        if !labels.names[labels.genomes..].contains(name) {
+            labels.names.push(name.clone());
+        }
+    }
+    let remap = old_ids(&idx, &labels);
     let tmp: Vec<String> = (0..genomes.len()).map(|g| format!("{out}.tmp{g}")).collect();
-    let result = build_runs(&genomes, &tmp, jobs).and_then(|new_totals| {
-        let mut sources: Vec<Box<dyn Source + '_>> = vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0 })];
-        sources.extend(run_sources(&tmp, idx.names.len())?);
-        let names: Vec<&str> = idx.names.iter().chain(genomes.iter().map(|g| &g.0)).map(String::as_str).collect();
-        let totals: Vec<u64> = idx.totals.iter().chain(&new_totals).copied().collect();
-        merge(sources, &names, &totals, out)
+    // new genomes use the old index's window: the same k-mers must be kept
+    let result = build_runs(&genomes, &tmp, jobs, idx.w).and_then(|new_totals| {
+        let mut sources: Vec<Box<dyn Source + '_>> = vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0, remap })];
+        sources.extend(run_sources(&tmp, idx.genomes)?);
+        let totals: Vec<u64> = idx.totals[..idx.genomes].iter().chain(&new_totals).copied().collect();
+        merge(sources, &labels, &totals, idx.w, out)
     });
     for t in &tmp {
         let _ = fs::remove_file(t);
@@ -165,23 +258,29 @@ pub fn repack(old: &str, out: &str) -> Res<()> {
         return Err("repack: --out must differ from the old index, which is read while the new one is written".into());
     }
     let idx = Index::load(old)?;
-    let names: Vec<&str> = idx.names.iter().map(String::as_str).collect();
-    merge(vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0 })], &names, &idx.totals, out)
+    let labels = idx.labels();
+    let remap = old_ids(&idx, &labels);
+    merge(vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0, remap })], &labels, &idx.totals[..idx.genomes], idx.w, out)
+}
+
+/// New id of each id of `idx`, by name.
+fn old_ids(idx: &Index, labels: &Labels) -> Vec<u16> {
+    idx.names.iter().map(|n| labels.names.iter().position(|x| x == n).unwrap() as u16).collect()
 }
 
 /// Sorted (k-mer, organism id) pairs, each k-mer once.
 trait Source {
-    fn next(&mut self) -> Res<Option<(u64, u8)>>;
+    fn next(&mut self) -> Res<Option<(u64, u16)>>;
 }
 
 /// A per-genome run file: every k-mer belongs to one organism.
 struct Run {
     r: BufReader<fs::File>,
-    id: u8,
+    id: u16,
 }
 
 impl Source for Run {
-    fn next(&mut self) -> Res<Option<(u64, u8)>> {
+    fn next(&mut self) -> Res<Option<(u64, u16)>> {
         Ok(next_u64(&mut self.r)?.map(|k| (k, self.id)))
     }
 }
@@ -191,7 +290,7 @@ fn run_sources(tmp: &[String], first_id: usize) -> Res<Vec<Box<dyn Source + 'sta
         .enumerate()
         .map(|(g, t)| {
             let r = BufReader::with_capacity(1 << 20, fs::File::open(t).map_err(|e| format!("{t}: {e}"))?);
-            Ok(Box::new(Run { r, id: (first_id + g) as u8 }) as Box<dyn Source>)
+            Ok(Box::new(Run { r, id: (first_id + g) as u16 }) as Box<dyn Source>)
         })
         .collect()
 }
@@ -201,10 +300,11 @@ struct OldIndex<'a> {
     idx: &'a Index,
     pos: usize,
     prefix: usize, // prefix of the entry at `pos`, for 4-byte entries
+    remap: Vec<u16>, // new id of each old id
 }
 
 impl Source for OldIndex<'_> {
-    fn next(&mut self) -> Res<Option<(u64, u8)>> {
+    fn next(&mut self) -> Res<Option<(u64, u16)>> {
         let idx = self.idx;
         if self.pos >= idx.len {
             return Ok(None);
@@ -221,14 +321,18 @@ impl Source for OldIndex<'_> {
             }
             (self.prefix as u64) << (KMER_BITS - idx.prefix_bits) | e >> idx.id_bits
         } else {
-            e >> 8
+            e >> idx.id_bits
         };
         self.pos += 1;
-        Ok(Some((kmer, idx.id(e))))
+        let id = match idx.id(e) {
+            SHARED => SHARED,
+            id => self.remap[id as usize],
+        };
+        Ok(Some((kmer, id)))
     }
 }
 
-fn build_runs(genomes: &[(String, String)], tmp: &[String], jobs: usize) -> Res<Vec<u64>> {
+fn build_runs(genomes: &[Genome], tmp: &[String], jobs: usize, w: usize) -> Res<Vec<u64>> {
     // Plain threads, not rayon tasks: while one genome sorts, rayon work stealing
     // could start more genomes and break the memory bound.
     let next = AtomicUsize::new(0);
@@ -243,7 +347,7 @@ fn build_runs(genomes: &[(String, String)], tmp: &[String], jobs: usize) -> Res<
                             return done;
                         }
                         eprintln!("reading {}", genomes[g].0);
-                        done.push((g, genome_run(&genomes[g].1, &tmp[g])));
+                        done.push((g, genome_run(&genomes[g].1, &tmp[g], w)));
                     }
                 })
             })
@@ -258,11 +362,13 @@ fn build_runs(genomes: &[(String, String)], tmp: &[String], jobs: usize) -> Res<
 }
 
 /// k-way merge of sorted sources. Each source holds a k-mer at most once, so a
-/// k-mer coming from two sources is in two genomes and becomes `SHARED`; one from a
-/// single source keeps its id (which may already be `SHARED`).
-fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], out: &str) -> Res<()> {
+/// k-mer coming from two sources is in two genomes and becomes `SHARED`, or their
+/// group's id if both are in one group; one from a single source keeps its id.
+/// `totals`: minimizers per organism genome.
+fn merge(mut runs: Vec<Box<dyn Source + '_>>, labels: &Labels, totals: &[u64], window: usize, out: &str) -> Res<()> {
+    let names = &labels.names;
     let mut heap = BinaryHeap::new();
-    let mut ids = vec![0u8; runs.len()];
+    let mut ids = vec![0u16; runs.len()];
     for (g, r) in runs.iter_mut().enumerate() {
         if let Some((k, id)) = r.next()? {
             ids[g] = id;
@@ -279,7 +385,7 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], ou
     let mut table = TableWriter::create(&format!("{out}.table"), prefix_bits)?;
     let mut unique = vec![0u64; names.len()];
     while let Some(Reverse((kmer, g))) = heap.pop() {
-        let (mut owners, first_id) = (1, ids[g]);
+        let mut id = ids[g];
         if let Some((k, id)) = runs[g].next()? {
             ids[g] = id;
             heap.push(Reverse((k, g)));
@@ -289,13 +395,12 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], ou
                 break;
             }
             heap.pop();
-            owners += 1;
+            id = labels.combine(id, ids[g2]);
             if let Some((k, id)) = runs[g2].next()? {
                 ids[g2] = id;
                 heap.push(Reverse((k, g2)));
             }
         }
-        let id = if owners == 1 { first_id } else { SHARED };
         if id != SHARED {
             unique[id as usize] += 1;
         }
@@ -312,14 +417,30 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, names: &[&str], totals: &[u64], ou
     w.flush()?;
     table.finish()?;
 
-    // "contam2" is the format tag from before the rename to bycatch: changing it breaks existing indexes
-    let mut meta = format!("contam2\t{K}\t{W}\t{prefix_bits}\t{entry_bytes}\n");
+    // "contam2" is the format tag from before the rename to bycatch: changing it breaks
+    // existing indexes. "contam3" adds the id bits and groups; it is written only when needed,
+    // so indexes without groups and up to 255 organisms stay as they were.
+    let v3 = id_bits > 8 || names.len() > labels.genomes;
+    let mut meta = match v3 {
+        true => format!("contam3\t{K}\t{window}\t{prefix_bits}\t{entry_bytes}\t{id_bits}\n"),
+        false => format!("contam2\t{K}\t{window}\t{prefix_bits}\t{entry_bytes}\n"),
+    };
+    for x in labels.genomes..names.len() {
+        eprintln!("group {}: {} unique minimizers", names[x], unique[x]);
+    }
     eprintln!("organism\tminimizers\tunique\tunique_fraction");
-    for (g, name) in names.iter().enumerate() {
-        meta += &format!("{name}\t{}\t{}\n", totals[g], unique[g]);
+    for (g, name) in names[..labels.genomes].iter().enumerate() {
+        meta += &format!("{name}\t{}\t{}", totals[g], unique[g]);
+        if v3 {
+            meta += &format!("\t{}", labels.group_of[g].map_or("-", |x| names[x].as_str()));
+        }
+        meta += "\n";
         let frac = unique[g] as f64 / totals[g].max(1) as f64;
         let warn = if frac < 0.5 { "\tWARNING: low, reduced sensitivity" } else { "" };
         eprintln!("{name}\t{}\t{}\t{frac:.3}{warn}", totals[g], unique[g]);
+    }
+    for x in labels.genomes..names.len() {
+        meta += &format!("{}\t0\t{}\t@group\n", names[x], unique[x]);
     }
     fs::write(format!("{out}.meta"), meta)?;
     Ok(())
@@ -374,6 +495,49 @@ impl TableWriter {
     }
 }
 
+/// `bycatch info`: layout, organisms and groups of an index, as TSV on stdout.
+pub fn info(prefix: &str) -> Res<()> {
+    let idx = Index::load(prefix)?;
+    let meta = fs::read_to_string(format!("{prefix}.meta"))?;
+    let format = meta.split('\t').next().unwrap_or("");
+    let size: u64 = ["kmers", "table", "meta"]
+        .iter()
+        .filter_map(|e| fs::metadata(format!("{prefix}.{e}")).ok())
+        .map(|m| m.len())
+        .sum();
+    let mut out = String::new();
+    for (key, value) in [
+        ("format", format.to_string()),
+        ("k", K.to_string()),
+        ("w", idx.w.to_string()),
+        ("entry_bytes", idx.entry_bytes.to_string()),
+        ("id_bits", idx.id_bits.to_string()),
+        ("prefix_bits", idx.prefix_bits.to_string()),
+        ("entries", idx.len.to_string()),
+        ("size_bytes", size.to_string()),
+        ("organisms", idx.genomes.to_string()),
+        ("groups", (idx.names.len() - idx.genomes).to_string()),
+    ] {
+        out += &format!("# {key}\t{value}\n");
+    }
+    out += "organism\tminimizers\tunique\tunique_fraction\tgroup\n";
+    for g in 0..idx.genomes {
+        let frac = idx.markers[g] as f64 / idx.totals[g].max(1) as f64;
+        let group = idx.group_of[g].map_or("-", |x| idx.names[x].as_str());
+        out += &format!("{}\t{}\t{}\t{frac:.3}\t{group}\n", idx.names[g], idx.totals[g], idx.markers[g]);
+    }
+    if idx.names.len() > idx.genomes {
+        out += "group\tunique\tmembers\n";
+        for x in idx.genomes..idx.names.len() {
+            let members: Vec<&str> =
+                (0..idx.genomes).filter(|&g| idx.group_of[g] == Some(x)).map(|g| idx.names[g].as_str()).collect();
+            out += &format!("{}\t{}\t{}\n", idx.names[x], idx.markers[x], members.join(","));
+        }
+    }
+    print!("{out}");
+    Ok(())
+}
+
 pub struct Index {
     entries: memmap2::Mmap,
     /// None for version-1 indexes: one sorted array, no prefix table
@@ -385,11 +549,17 @@ pub struct Index {
     /// low bits of an entry holding the organism id; all ones means shared
     id_bits: u32,
     len: usize,
+    /// organisms (ids 0..genomes), then groups
     pub names: Vec<String>,
-    /// unique marker k-mers per organism
+    pub genomes: usize,
+    /// per organism: id of its group
+    pub group_of: Vec<Option<usize>>,
+    /// unique marker k-mers per organism or group
     pub markers: Vec<u64>,
-    /// minimizers per organism genome, shared ones included
+    /// minimizers per organism genome, shared ones included; 0 for groups
     totals: Vec<u64>,
+    /// minimizer window the index was built with
+    pub w: usize,
 }
 
 fn map(path: &str) -> Res<memmap2::Mmap> {
@@ -422,29 +592,60 @@ impl Index {
         let meta = fs::read_to_string(&meta_path).map_err(|e| format!("{meta_path}: {e}"))?;
         let mut lines = meta.lines();
         let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
-        let bad = || format!("{meta_path}: not a bycatch index for k={K}, w={W}");
-        if head.len() < 3 || head[1] != K.to_string() || head[2] != W.to_string() {
+        let bad = || format!("{meta_path}: not a bycatch index for k={K}");
+        if head.len() < 3 || head[1] != K.to_string() {
             return Err(bad().into());
         }
-        let (prefix_bits, entry_bytes, has_table) = match (head[0], &head[3..]) {
-            ("contam1", []) => (0, 8, false),
-            ("contam2", [p, b]) => (p.parse()?, b.parse()?, true),
+        let w: usize = head[2].parse().map_err(|_| bad())?;
+        if !W_RANGE.contains(&w) {
+            return Err(bad().into());
+        }
+        let (prefix_bits, entry_bytes, has_table, wide_bits) = match (head[0], &head[3..]) {
+            ("contam1", []) => (0, 8, false, None),
+            ("contam2", [p, b]) => (p.parse()?, b.parse()?, true, None),
+            ("contam3", [p, b, i]) => (p.parse()?, b.parse()?, true, Some(i.parse::<u32>()?)),
             _ => return Err(bad().into()),
         };
         let compact = entry_bytes == 4 && (COMPACT_BASE_BITS + 1..=COMPACT_MAX_PREFIX_BITS).contains(&prefix_bits);
         if !(entry_bytes == 8 || compact) || prefix_bits > COMPACT_MAX_PREFIX_BITS {
             return Err(bad().into());
         }
-        let id_bits = if entry_bytes == 4 { prefix_bits - COMPACT_BASE_BITS } else { 8 };
-        let (mut names, mut markers, mut totals) = (Vec::new(), Vec::new(), Vec::new());
+        let id_bits = match (entry_bytes, wide_bits) {
+            (4, _) => prefix_bits - COMPACT_BASE_BITS,
+            (_, Some(b)) if (8..=10).contains(&b) => b,
+            (_, Some(_)) => return Err(bad().into()),
+            _ => 8,
+        };
+        let (mut names, mut markers, mut totals, mut groups) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut genomes = 0;
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 3 {
-                return Err(format!("{meta_path}: bad line '{line}'").into());
+            let group = match (wide_bits, &f[..]) {
+                (None, [_, _, _]) => None,
+                (Some(_), [_, _, _, g]) => Some(*g),
+                _ => return Err(format!("{meta_path}: bad line '{line}'").into()),
+            };
+            if group != Some("@group") {
+                if names.len() > genomes {
+                    return Err(format!("{meta_path}: organism line after a group: '{line}'").into());
+                }
+                genomes += 1;
+                groups.push(group.filter(|&g| g != "-").map(str::to_string));
             }
             names.push(f[0].to_string());
             totals.push(f[1].parse()?);
             markers.push(f[2].parse()?);
+        }
+        let mut group_of = Vec::with_capacity(genomes);
+        for g in &groups {
+            group_of.push(match g {
+                None => None,
+                Some(g) => Some(
+                    (genomes..names.len())
+                        .find(|&x| &names[x] == g)
+                        .ok_or_else(|| format!("{meta_path}: unknown group '{g}'"))?,
+                ),
+            });
         }
         if names.len() >= 1 << id_bits {
             return Err(format!("{meta_path}: {} organisms do not fit {id_bits} id bits", names.len()).into());
@@ -466,11 +667,18 @@ impl Index {
             None
         };
         let key_mask = if entry_bytes == 4 { (1u64 << (KMER_BITS - prefix_bits)) - 1 } else { u64::MAX };
-        let idx = Index { entries, table, prefix_bits, entry_bytes, key_mask, id_bits, len, names, markers, totals };
+        let idx =
+            Index { entries, table, prefix_bits, entry_bytes, key_mask, id_bits, len, names, genomes, group_of, markers, totals, w };
         if idx.table.is_some() && idx.offset(1 << prefix_bits) != len {
             return Err(format!("{prefix}.table: does not match {kmers_path}").into());
         }
         Ok(idx)
+    }
+
+    /// Share of an organism's minimizers that are its markers: what a read copied from
+    /// its reference would hit, on average.
+    pub fn unique_fraction(&self, g: usize) -> f64 {
+        self.markers[g] as f64 / self.totals[g].max(1) as f64
     }
 
     /// Number of entries.
@@ -478,12 +686,17 @@ impl Index {
         self.len
     }
 
-    /// Organism id of an entry, `SHARED` for the all-ones id.
-    fn id(&self, entry: u64) -> u8 {
+    /// Organisms and groups, to write this index again.
+    fn labels(&self) -> Labels {
+        Labels { names: self.names.clone(), genomes: self.genomes, group_of: self.group_of.clone() }
+    }
+
+    /// Organism or group id of an entry, `SHARED` for the all-ones id.
+    fn id(&self, entry: u64) -> u16 {
         let mask = (1u64 << self.id_bits) - 1;
         match entry & mask {
             m if m == mask => SHARED,
-            id => id as u8,
+            id => id as u16,
         }
     }
 
@@ -499,7 +712,7 @@ impl Index {
 
     /// Position in the index and organism id (or `SHARED`) of a canonical k-mer.
     #[cfg(test)]
-    pub fn lookup(&self, kmer: u64) -> Option<(usize, u8)> {
+    pub fn lookup(&self, kmer: u64) -> Option<(usize, u16)> {
         let (lo, hi) = self.range(kmer);
         self.find_in(kmer, lo, hi)
     }
@@ -532,14 +745,14 @@ impl Index {
     }
 
     /// `lookup` within a `range`.
-    pub fn find_in(&self, kmer: u64, lo: usize, hi: usize) -> Option<(usize, u8)> {
+    pub fn find_in(&self, kmer: u64, lo: usize, hi: usize) -> Option<(usize, u16)> {
         let key = kmer & self.key_mask;
         if self.entry_bytes == 4 {
             let v = &bytemuck::cast_slice::<u8, u32>(&self.entries)[lo..hi];
             find(v, key, self.id_bits).map(|i| (lo + i, self.id(v[i] as u64)))
         } else {
             let v = &bytemuck::cast_slice::<u8, u64>(&self.entries)[lo..hi];
-            find(v, key, 8).map(|i| (lo + i, self.id(v[i])))
+            find(v, key, self.id_bits).map(|i| (lo + i, self.id(v[i])))
         }
     }
 }
@@ -565,9 +778,9 @@ mod tests {
         assert!(mask_adapters(&rc).unwrap()[a..b].iter().all(|&c| c == b'N'));
     }
 
-    struct VecSource(std::vec::IntoIter<u64>, u8);
+    struct VecSource(std::vec::IntoIter<u64>, u16);
     impl Source for VecSource {
-        fn next(&mut self) -> Res<Option<(u64, u8)>> {
+        fn next(&mut self) -> Res<Option<(u64, u16)>> {
             Ok(self.0.next().map(|k| (k, self.1)))
         }
     }
@@ -596,9 +809,9 @@ mod tests {
         let sources = || -> Vec<Box<dyn Source>> {
             vec![Box::new(VecSource(a.clone().into_iter(), 0)), Box::new(VecSource(b.clone().into_iter(), 1))]
         };
-        let names = ["a", "b"];
-        merge(sources(), &names, &[10, 10], &p("wide")).unwrap();
-        merge(sources(), &names, &[1 << 24, 0], &p("compact")).unwrap();
+        let names = Labels::new(&[("a".into(), None), ("b".into(), None)]).unwrap();
+        merge(sources(), &names, &[10, 10], crate::kmer::W, &p("wide")).unwrap();
+        merge(sources(), &names, &[1 << 24, 0], crate::kmer::W, &p("compact")).unwrap();
         let (wide, compact) = (Index::load(&p("wide")).unwrap(), Index::load(&p("compact")).unwrap());
         assert_eq!((wide.entry_bytes, compact.entry_bytes, compact.id_bits, compact.prefix_bits), (8, 4, 2, 24));
         repack(&p("compact"), &p("repacked")).unwrap();
@@ -623,7 +836,8 @@ mod tests {
     fn decode_round_trip() {
         let prefix = std::env::var("BYCATCH_TEST_INDEX").expect("set BYCATCH_TEST_INDEX");
         let idx = Index::load(&prefix).unwrap();
-        let mut src = OldIndex { idx: &idx, pos: 0, prefix: 0 };
+        let remap = (0..idx.names.len() as u16).collect();
+        let mut src = OldIndex { idx: &idx, pos: 0, prefix: 0, remap };
         let (mut last, mut n) = (None, 0usize);
         while let Some((kmer, id)) = src.next().unwrap() {
             assert!(last < Some(kmer), "not sorted at {n}");

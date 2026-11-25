@@ -4,8 +4,11 @@ use std::collections::VecDeque;
 
 /// 27 bases = 54 bits, which leaves 8 bits of a u64 for the organism id.
 pub const K: usize = 27;
-/// Window of 15 k-mers: about 1 k-mer in 8 kept, at least one per 41 bp.
+/// Default window of 15 k-mers: about 1 k-mer in 8 kept, at least one per 41 bp.
+/// `bycatch build --window` sets another; the index records it.
 pub const W: usize = 15;
+/// Windows `build --window` accepts. Density is about 2 / (w + 1).
+pub const W_RANGE: std::ops::RangeInclusive<usize> = 5..=31;
 const MASK: u64 = (1 << (2 * K)) - 1;
 
 fn code(b: u8) -> Option<u64> {
@@ -34,9 +37,9 @@ pub fn low_complexity(kmer: u64) -> bool {
     seen.count_ones() < 8
 }
 
-/// Appends the canonical minimizer k-mers of `seq` to `out` (duplicates possible).
-/// Any non-ACGT byte breaks the sequence.
-pub fn minimizers(seq: &[u8], out: &mut Vec<u64>) {
+/// Appends the canonical minimizer k-mers of `seq`, one per window of `w` k-mers, to
+/// `out` (duplicates possible). Any non-ACGT byte breaks the sequence.
+pub fn minimizers(seq: &[u8], w: usize, out: &mut Vec<u64>) {
     let mut emit = |kmer: u64| {
         if !low_complexity(kmer) {
             out.push(kmer)
@@ -49,7 +52,7 @@ pub fn minimizers(seq: &[u8], out: &mut Vec<u64>) {
     for c in seq.iter().map(|&b| code(b)).chain(std::iter::once(None)) {
         let Some(c) = c else {
             // run shorter than one window: keep its single minimum
-            if len >= K && len - K + 1 < W {
+            if len >= K && len - K + 1 < w {
                 emit(q[0].1);
             }
             q.clear();
@@ -70,10 +73,10 @@ pub fn minimizers(seq: &[u8], out: &mut Vec<u64>) {
             q.pop_back();
         }
         q.push_back((h, kmer, n));
-        if q[0].2 + W <= n {
+        if q[0].2 + w <= n {
             q.pop_front();
         }
-        if n + 1 >= W && q[0].2 != last {
+        if n + 1 >= w && q[0].2 != last {
             last = q[0].2;
             emit(q[0].1);
         }
@@ -109,7 +112,7 @@ mod tests {
 
     fn set(seq: &[u8]) -> Vec<u64> {
         let mut v = Vec::new();
-        minimizers(seq, &mut v);
+        minimizers(seq, W, &mut v);
         v.sort_unstable();
         v.dedup();
         v

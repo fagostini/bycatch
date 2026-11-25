@@ -37,6 +37,10 @@ compact layout existed.
 
 ### Scan
 
+Rechecked on 2026-11-25 after `--min-frac`, groups and `--depleted-out`: lane A with the
+95-organism index, 16 threads, medians of 3. `--every 50` took 1.86 s before and 1.90 s
+after; `--every 1` took 7.9 s before and 6.3 s after (noisy). No slowdown.
+
 One paired-end lane pair (lane A) from a NovaSeq run of 246 samples (the benchmark run) (~0.37 GB gz R1+R2, ~660 Mb),
 index warm in page cache:
 
@@ -116,7 +120,8 @@ Fraction of human reads classified, by read length (w = 15):
 5. **Close relatives cancel each other.** A k-mer present in two genomes becomes `shared` and
    counts for neither. Two strains of one species, or two species of one genus, lose most of
    their markers. `build` warns when an organism keeps less than 50 % unique markers.
-   Group such genomes under one name instead.
+   Put such genomes in one group (third column of the genome list): what they share then
+   counts for the group, and what is unique still counts for each genome.
 6. **Exact 27-mer matching needs close sequence identity.** A contaminant that is a different
    strain or species from the reference (more than a few % divergent) gives fewer hits and may
    end up as `weak` or `unmatched`. High-error long reads (ONT, ~5–10 %) also lose k-mers, but
@@ -157,14 +162,14 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 
 | Limit | Value | Cause |
 |---|---|---|
-| Organisms per index | 255 | 8-bit organism id; 255 is the `shared` tag |
+| Organisms per index | 1023 (organisms plus groups) | 10 id bits beside a 54-bit k-mer in 8-byte entries; up to 255, the compact 4-byte layout |
 | Index size | must fit in free RAM (page cache) | lookups are random; from disk the scan is orders of magnitude slower |
 | On this machine | ~55 GB free → ~145 Gb of genomes | 2.15 GB table (65–127 organisms) + 0.35 bytes per base; `count3r` (45.8 GB) uses most of it |
 | Encrypted home (ecryptfs) | index must live elsewhere | ecryptfs caches each page twice (encrypted and decrypted), so the index needs twice its size in RAM; `count3` scans were 25× slower from there |
 | Read length | ≥ 41 bp for at least one minimizer, ≥ ~100 bp for reliable calls | w = 15, k = 27, 2-hit rule |
 | k-mer length | fixed at 27 | `kmer << 8 \| id` must fit in 64 bits |
 | Paired files | R1 and R2 must have the same number of records in the same order | checked; a mismatch is an error |
-| Classification threads | `--threads`, default 4 | plus one reader thread per input file; decompression stays single-threaded per file |
+| Classification threads | `--threads`, default 4 | plus one reader thread per input file; BGZF input is inflated on 1–4 more threads per file, other gzip on one |
 | Prefix-table offsets | < 2³² entries per block of 2¹⁶ prefixes | never reached in practice; `build` checks it |
 
 ## 4. Ways to reduce index size, memory and runtime
@@ -193,10 +198,17 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 
 ### Runtime
 
-- **At `--every 50` decompression sets most of the speed** (with the compact index). Options, in order of effect:
+- **At `--every 50` decompression sets most of the speed** (with the compact index).
+  - BGZF input, bcl-convert's default, is now inflated on several threads.
+  - On lane A that cut `--every 50` from 1.90 s to 1.66 s (medians of 3). After that,
+    parsing every record on the reader thread is the limit.
+  - `--every 1` is unchanged at 6.0 s.
+
+  Options, in order of effect:
   - run several files in parallel (8 at a time in the 492-pair run above);
-  - decompress with a parallel tool and pipe in: `rapidgzip -dc R1.fastq.gz | bycatch scan ... -`
-    (only for single-end; paired input needs two files);
+  - for plain (non-BGZF) gzip, decompress with a parallel tool and pipe in:
+    `rapidgzip -dc R1.fastq.gz | bycatch scan ... -` (only for single-end; paired input
+    needs two files);
   - the `zlib-rs` backend is already in use.
 - **At `--every 1` index lookups set the speed** (53 s against 3.5 s per lane pair with the
   compact index and one thread; the prefix table already cut it from 196 s). Classification
