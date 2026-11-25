@@ -1,3 +1,4 @@
+mod bgzf;
 mod index;
 mod kmer;
 mod run;

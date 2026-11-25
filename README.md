@@ -312,6 +312,9 @@ that genome, and host reads with read-through became `conflict`.
   A full scan of one lane took 966 s from there and 37.6 s from `/var/tmp`; with the
   index and the input warm in page cache, 3.3 s today (see PERFORMANCE.md).
   FASTQ input is read once, front to back, so it can stay in the encrypted home.
+- BGZF input (blocked gzip, bcl-convert's default) is inflated in parallel: batches of
+  256 blocks on a quarter of `--threads` (1 to 4) per file, each block checked against its
+  CRC32. Plain gzip, plain text and stdin are read as one stream.
 - R1 is read in full on its own thread. Only record 1, 1 + N, 1 + 2N, … is classified
   (`--every N`); the rest is decompressed and skipped. Taking every Nth read, not the
   first reads, means every part of the run (all tiles, all of the file) is represented.
@@ -483,6 +486,7 @@ or run sylph against GTDB, to find organisms missing from the index.
 
 | File | Content |
 |---|---|
+| `src/bgzf.rs` | parallel BGZF reader |
 | `src/kmer.rs` | 2-bit encoding, canonical k-mers, hash, low-complexity filter, minimizers |
 | `src/index.rs` | build, add and repack (per-genome runs, merge, groups, id-sized layout, prefix table), `.meta` format, load, lookup with prefetch |
 | `src/scan.rs` | sampling, reader threads, parallel classification (lookups prefetched per fragment), adapters, groups, duplicates, Wilson intervals, EM, `--precision`, report, `--depleted-out` |

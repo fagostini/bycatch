@@ -11,9 +11,22 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-fn open(path: &str) -> Res<Box<dyn FastxReader>> {
-    let r = if path == "-" { parse_fastx_stdin() } else { parse_fastx_file(path) };
+/// FASTQ/FASTA reader. BGZF input (bcl-convert's default) is inflated on `decoders`
+/// threads; plain gzip, plain text and stdin (`-`) go through needletail as they are.
+fn open(path: &str, decoders: usize) -> Res<Box<dyn FastxReader>> {
+    let r = if path == "-" {
+        parse_fastx_stdin()
+    } else if crate::bgzf::is_bgzf(path) {
+        needletail::parse_fastx_reader(crate::bgzf::BgzfReader::open(path, decoders)?)
+    } else {
+        parse_fastx_file(path)
+    };
     r.map_err(|e| format!("{path}: {e}").into())
+}
+
+/// Threads inflating each BGZF file: a quarter of the classifier threads, 1 to 4.
+fn decoders(threads: usize) -> usize {
+    (threads / 4).clamp(1, 4)
 }
 
 /// Below this diversity an organism's hits pile on few markers: a conserved gene
@@ -56,10 +69,10 @@ struct MateReader {
 }
 
 impl MateReader {
-    fn start(path: String, every: u64, raw: bool) -> MateReader {
+    fn start(path: String, every: u64, raw: bool, decoders: usize) -> MateReader {
         let (tx, rx) = sync_channel::<Vec<Mate>>(16);
         let thread = std::thread::spawn(move || -> Res<u64> {
-            let mut reader = open(&path)?;
+            let mut reader = open(&path, decoders)?;
             let (mut n, mut batch) = (0u64, Vec::new());
             while let Some(rec) = reader.next() {
                 let rec = rec.map_err(|e| format!("{path}: {e}"))?;
@@ -193,20 +206,22 @@ struct Fragment {
     raw: Option<(Raw, Option<Raw>)>, // R1 and R2 id and qualities, for --depleted-out
 }
 
-/// Reads R1 (and R2 through a MateReader) and sends the sampled fragments in batches.
-/// Stops after `max_reads` fragments, or when the receiver is dropped.
-/// Returns the records read and whether it stopped before the end of the file.
-fn read_fragments(
-    r1: &str,
-    r2: Option<&str>,
+/// What the reader keeps of each record, and how it samples.
+struct Sampling {
     every: u64,
     max_reads: Option<u64>,
     keep_ids: bool,
-    keep_raw: bool,
-    tx: SyncSender<Vec<Fragment>>,
-) -> Res<(u64, bool)> {
-    let mut reader = open(r1)?;
-    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every, keep_raw));
+    keep_raw: bool,  // ids and qualities, for --depleted-out
+    decoders: usize, // threads inflating each BGZF file
+}
+
+/// Reads R1 (and R2 through a MateReader) and sends the sampled fragments in batches.
+/// Stops after `max_reads` fragments, or when the receiver is dropped.
+/// Returns the records read and whether it stopped before the end of the file.
+fn read_fragments(r1: &str, r2: Option<&str>, sampling: Sampling, tx: SyncSender<Vec<Fragment>>) -> Res<(u64, bool)> {
+    let Sampling { every, max_reads, keep_ids, keep_raw, decoders } = sampling;
+    let mut reader = open(r1, decoders)?;
+    let mut mates = r2.map(|p| MateReader::start(p.to_string(), every, keep_raw, decoders));
     let (mut n, mut sampled, mut stopped) = (0u64, 0u64, false);
     let mut batch = Vec::with_capacity(BATCH);
     while let Some(rec) = reader.next() {
@@ -747,8 +762,8 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     let keep_ids = dump.is_some() || opts.unmatched_out.is_some();
     let keep_raw = depleted.is_some();
     let (r1s, r2s, every, max_reads) = (r1.to_string(), r2.map(str::to_string), opts.every, opts.max_reads);
-    let reader =
-        std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), every, max_reads, keep_ids, keep_raw, tx));
+    let sampling = Sampling { every, max_reads, keep_ids, keep_raw, decoders: decoders(opts.threads) };
+    let reader = std::thread::spawn(move || read_fragments(&r1s, r2s.as_deref(), sampling, tx));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(opts.threads).build()?;
     for batch in rx {
         let calls: Vec<Call> =

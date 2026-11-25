@@ -169,7 +169,7 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 | Read length | ≥ 41 bp for at least one minimizer, ≥ ~100 bp for reliable calls | w = 15, k = 27, 2-hit rule |
 | k-mer length | fixed at 27 | `kmer << 8 \| id` must fit in 64 bits |
 | Paired files | R1 and R2 must have the same number of records in the same order | checked; a mismatch is an error |
-| Classification threads | `--threads`, default 4 | plus one reader thread per input file; decompression stays single-threaded per file |
+| Classification threads | `--threads`, default 4 | plus one reader thread per input file; BGZF input is inflated on 1–4 more threads per file, other gzip on one |
 | Prefix-table offsets | < 2³² entries per block of 2¹⁶ prefixes | never reached in practice; `build` checks it |
 
 ## 4. Ways to reduce index size, memory and runtime
@@ -198,10 +198,17 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 
 ### Runtime
 
-- **At `--every 50` decompression sets most of the speed** (with the compact index). Options, in order of effect:
+- **At `--every 50` decompression sets most of the speed** (with the compact index).
+  - BGZF input, bcl-convert's default, is now inflated on several threads.
+  - On lane A that cut `--every 50` from 1.90 s to 1.66 s (medians of 3). After that,
+    parsing every record on the reader thread is the limit.
+  - `--every 1` is unchanged at 6.0 s.
+
+  Options, in order of effect:
   - run several files in parallel (8 at a time in the 492-pair run above);
-  - decompress with a parallel tool and pipe in: `rapidgzip -dc R1.fastq.gz | bycatch scan ... -`
-    (only for single-end; paired input needs two files);
+  - for plain (non-BGZF) gzip, decompress with a parallel tool and pipe in:
+    `rapidgzip -dc R1.fastq.gz | bycatch scan ... -` (only for single-end; paired input
+    needs two files);
   - the `zlib-rs` backend is already in use.
 - **At `--every 1` index lookups set the speed** (53 s against 3.5 s per lane pair with the
   compact index and one thread; the prefix table already cut it from 196 s). Classification

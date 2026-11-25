@@ -405,3 +405,49 @@ fn smaller_window() {
     assert!(!out.status.success());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// BGZF (as bcl-convert writes), plain gzip and plain FASTQ give the same report.
+#[test]
+fn bgzf_input() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("bycatch_bgzfin_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let mut rng = Rng(0xBF58476D1CE4E5B9);
+    let (a, b) = (rng.seq(100_000), rng.seq(100_000));
+    std::fs::write(p("list.tsv"), write_genomes(&dir, &[("a", &a, None), ("b", &b, None)])).unwrap();
+    run(&["build", &p("list.tsv"), "--out", &p("idx")]);
+    let reads: Vec<Vec<u8>> = (0..20_000)
+        .map(|i| {
+            let g = if i % 5 == 0 { &b } else { &a };
+            let s = rng.next() as usize % (g.len() - 150);
+            g[s..s + 150].to_vec()
+        })
+        .collect();
+    let fq = reads_fq(&reads);
+    std::fs::write(p("r.fq"), &fq).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(fq.as_bytes()).unwrap();
+    std::fs::write(p("r.fq.gz"), gz.finish().unwrap()).unwrap();
+    // BGZF: gzip members of at most 64 KB, each with a BC subfield giving its size
+    let mut bgzf = Vec::new();
+    for part in fq.as_bytes().chunks(50_000).chain(std::iter::once(&[][..])) {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(part).unwrap();
+        let cdata = e.finish().unwrap();
+        bgzf.extend_from_slice(&[0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff, 6, 0, b'B', b'C', 2, 0]);
+        bgzf.extend_from_slice(&((18 + cdata.len() + 8 - 1) as u16).to_le_bytes());
+        bgzf.extend_from_slice(&cdata);
+        let mut c = flate2::Crc::new();
+        c.update(part);
+        bgzf.extend_from_slice(&c.sum().to_le_bytes());
+        bgzf.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    }
+    std::fs::write(p("r.bgzf.gz"), bgzf).unwrap();
+    let scan = |f: &str| run(&["scan", "-i", &p("idx"), "--host", "a", "--every", "1", "-t", "8", &p(f)]);
+    let plain = scan("r.fq");
+    assert_eq!(scan("r.fq.gz"), plain);
+    assert_eq!(scan("r.bgzf.gz"), plain);
+    assert!(parse(&plain)["b"] >= 3900.0, "{plain}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
