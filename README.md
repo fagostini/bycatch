@@ -119,10 +119,11 @@ target/release/bycatch add -i idx new_genomes.tsv --out idx2
 ```
 
 Reads only the new genomes and merges them into a copy of the index: their k-mers that
-are markers of an old organism, or already shared, become `shared`. The result is
+are markers of an old organism, or already shared, become `shared` (or their group's, if
+both organisms are in one group). The result is
 byte-identical to building from the old list followed by the new one (tested), and takes
 the time of reading the new genomes plus one pass over the old index. The old index is
-kept; `--out` must differ from it. Up to 255 organisms in all.
+kept; `--out` must differ from it. Up to 1023 organisms and groups in all.
 
 ### Shrinking an index built before the id-sized layout
 
@@ -196,8 +197,10 @@ run in order). For each distinct k-mer:
 
 - found in **one** genome: entry `kmer | organism_id`. This is a **marker** of
   that organism.
-- found in **two or more** genomes: one entry `kmer | all-ones id`, the **shared** tag
-  (255 with 8 id bits; section 6 says how many id bits an index uses).
+- found in **two or more** genomes of **one group**: entry `kmer | group_id`, a marker
+  of that group. Group ids follow the organism ids.
+- found in **two or more** genomes otherwise: one entry `kmer | all-ones id`, the
+  **shared** tag (255 with 8 id bits; section 6 says how many id bits an index uses).
 
 Shared entries are kept rather than deleted, so the scan can tell "sequence common to
 several references" apart from "sequence in none".
@@ -223,6 +226,10 @@ table stores where each group starts.
 - **Smaller indexes**: P is chosen so there are about 8 entries per prefix, and entries
   keep the full k-mer: `kmer << 8 | id`, **8 bytes**. The table is about 1/16 of the
   entries' size and only speeds up lookups.
+- **Over 255 organisms and groups**: the compact table would need 2³¹ slots or more
+  (8 GB), so entries keep the full k-mer with I = 9 or 10 id bits, `kmer << I | id`,
+  **8 bytes**, plus the small table. Up to 1023 organisms and groups. Such an index takes
+  about twice the bytes per entry of a compact one. Indexes up to 255 are unchanged.
 
 Offsets are stored as 32-bit values plus one 64-bit base per block of 2¹⁶ prefixes, so
 indexes with more than 2³² entries still work with a 4 GB table.

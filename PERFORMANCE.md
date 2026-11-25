@@ -157,7 +157,7 @@ the edge of the rule; a call seen in both lanes of a sample is the stronger sign
 
 | Limit | Value | Cause |
 |---|---|---|
-| Organisms per index | 255 | 8-bit organism id; 255 is the `shared` tag |
+| Organisms per index | 1023 (organisms plus groups) | 10 id bits beside a 54-bit k-mer in 8-byte entries; up to 255, the compact 4-byte layout |
 | Index size | must fit in free RAM (page cache) | lookups are random; from disk the scan is orders of magnitude slower |
 | On this machine | ~55 GB free → ~145 Gb of genomes | 2.15 GB table (65–127 organisms) + 0.35 bytes per base; `count3r` (45.8 GB) uses most of it |
 | Encrypted home (ecryptfs) | index must live elsewhere | ecryptfs caches each page twice (encrypted and decrypted), so the index needs twice its size in RAM; `count3` scans were 25× slower from there |

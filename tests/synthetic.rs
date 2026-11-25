@@ -209,3 +209,57 @@ fn mixed_sample() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Writes `name` genomes as FASTA in `dir`; returns the list lines `name<TAB>path[<TAB>group]`.
+fn write_genomes(dir: &std::path::Path, genomes: &[(&str, &[u8], Option<&str>)]) -> String {
+    let mut list = String::new();
+    for (name, g, group) in genomes {
+        let path = dir.join(name).to_str().unwrap().to_string();
+        std::fs::write(&path, format!(">{name}\n{}\n", String::from_utf8_lossy(g))).unwrap();
+        writeln!(list, "{name}\t{path}{}", group.map_or(String::new(), |gr| format!("\t{gr}"))).unwrap();
+    }
+    list
+}
+
+fn reads_fq(reads: &[Vec<u8>]) -> String {
+    let mut fq = String::new();
+    for (i, r) in reads.iter().enumerate() {
+        writeln!(fq, "@r{i}\n{}\n+\n{}", String::from_utf8_lossy(r), "I".repeat(r.len())).unwrap();
+    }
+    fq
+}
+
+/// Over 255 organisms the index switches to wider ids; `add` across the limit gives the
+/// same result as one build.
+#[test]
+fn more_than_255_organisms() {
+    let dir = std::env::temp_dir().join(format!("bycatch_wide_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let mut rng = Rng(0xD1B54A32D192ED03);
+    let genomes: Vec<(String, Vec<u8>)> = (0..300).map(|i| (format!("g{i}"), rng.seq(3000))).collect();
+    let entries: Vec<(&str, &[u8], Option<&str>)> = genomes.iter().map(|(n, g)| (n.as_str(), g.as_slice(), None)).collect();
+    let list = write_genomes(&dir, &entries);
+    std::fs::write(p("all.tsv"), &list).unwrap();
+    let mut reads = Vec::new();
+    for g in [0, 150, 299] {
+        for k in 0..20 {
+            reads.push(genomes[g].1[k * 100..k * 100 + 100].to_vec());
+        }
+    }
+    std::fs::write(p("reads.fq"), reads_fq(&reads)).unwrap();
+    run(&["build", &p("all.tsv"), "--out", &p("all")]);
+    assert!(std::fs::read_to_string(p("all.meta")).unwrap().starts_with("contam3\t"));
+    let report = run(&["scan", "-i", &p("all"), "--every", "1", &p("reads.fq")]);
+    let r = parse(&report);
+    assert_eq!((r["g0"], r["g150"], r["g299"]), (20.0, 20.0, 20.0), "{report}");
+
+    let lines: Vec<&str> = list.lines().collect();
+    std::fs::write(p("first.tsv"), lines[..250].join("\n") + "\n").unwrap();
+    std::fs::write(p("rest.tsv"), lines[250..].join("\n") + "\n").unwrap();
+    run(&["build", &p("first.tsv"), "--out", &p("first")]);
+    assert!(std::fs::read_to_string(p("first.meta")).unwrap().starts_with("contam2\t"));
+    run(&["add", "-i", &p("first"), &p("rest.tsv"), "--out", &p("added")]);
+    assert_eq!(run(&["scan", "-i", &p("added"), "--every", "1", &p("reads.fq")]), report);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
