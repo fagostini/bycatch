@@ -270,6 +270,9 @@ fn groups() {
     // a's reads that fall wholly inside the block (~3 % of a) also go to the group
     assert!(r["a"] + r["ab"] >= 895.0 && r["a"] >= 760.0 && r["c"] >= 99.0, "{r:?}");
     assert!(report.lines().any(|l| l.starts_with("ab\t") && l.contains("group,host_group")), "{report}");
+    assert!(report.contains("# absent_below_percent\t0.38"), "Wilson upper end for 0 of 1000: {report}");
+    let info = run(&["info", "-i", &p("grouped")]);
+    assert!(info.contains("# organisms\t3\n# groups\t1\n") && info.contains("\nab\t") && info.contains("\ta,b\n"), "{info}");
     // contamination: c only, not the host's group
     let contam: f64 = report.lines().find(|l| l.starts_with("# contamination_percent")).unwrap().split('\t').nth(1).unwrap().parse().unwrap();
     assert!((contam - 100.0 * r["c"] / 1000.0).abs() < 1e-3, "{contam} {r:?}");
@@ -369,6 +372,36 @@ fn depleted_out() {
         .args(["scan", "-i", &p("idx"), "--host", "host", "--depleted-out", &p("x"), &p("r1.fq"), &p("r2.fq")])
         .output()
         .unwrap();
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `build --window 7` keeps about twice the minimizers: 50 bp reads get more of them,
+/// fewer stay unassigned, and the index records its window.
+#[test]
+fn smaller_window() {
+    let dir = std::env::temp_dir().join(format!("bycatch_window_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let mut rng = Rng(0x94D049BB133111EB);
+    let (a, b) = (rng.seq(200_000), rng.seq(200_000));
+    std::fs::write(p("list.tsv"), write_genomes(&dir, &[("a", &a, None), ("b", &b, None)])).unwrap();
+    let reads: Vec<Vec<u8>> = (0..2000)
+        .map(|_| {
+            let s = rng.next() as usize % (a.len() - 50);
+            a[s..s + 50].to_vec()
+        })
+        .collect();
+    std::fs::write(p("reads.fq"), reads_fq(&reads)).unwrap();
+    run(&["build", &p("list.tsv"), "--out", &p("w15")]);
+    run(&["build", &p("list.tsv"), "--out", &p("w7"), "--window", "7"]);
+    assert!(run(&["info", "-i", &p("w7")]).contains("# w\t7\n"));
+    let scan = |idx: &str| parse(&run(&["scan", "-i", &p(idx), "--every", "1", "--min-frac", "0", &p("reads.fq")]));
+    let (r15, r7) = (scan("w15"), scan("w7"));
+    assert!(r7["a"] > r15["a"] + 100.0, "w=7 assigns more 50 bp reads: {r15:?} {r7:?}");
+    assert_eq!(r7["b"], 0.0);
+    // out of range
+    let out = Command::new(env!("CARGO_BIN_EXE_bycatch")).args(["build", &p("list.tsv"), "--out", &p("x"), "--window", "3"]).output().unwrap();
     assert!(!out.status.success());
     std::fs::remove_dir_all(&dir).unwrap();
 }

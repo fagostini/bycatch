@@ -38,6 +38,13 @@ Build the index (writes `idx.kmers`, `idx.table` and `idx.meta`):
 target/release/bycatch build genomes.tsv --out idx --jobs 4
 ```
 
+`--window W` (5–31, default 15) sets the minimizer window. A smaller window keeps more
+k-mers, about 2 / (W + 1) of them, so short reads get more chances to hit: useful for
+2×50 data, at the cost of a larger index (W = 7 roughly doubles it). The index records its
+window, and scans and `add` use it. On simulated 2×50 cod-host sets, `--window 11` cut
+unassigned host reads from 19 % to 13 % and raised macro F1 by 0.01–0.03, for a 30 %
+larger index (COMPARISON.md, "Post-hoc: minimizer window"). Longer reads gain nothing.
+
 Scan a single-end file, a read pair, or stdin (`-`):
 
 ```bash
@@ -131,6 +138,16 @@ both organisms are in one group). The result is
 byte-identical to building from the old list followed by the new one (tested), and takes
 the time of reading the new genomes plus one pass over the old index. The old index is
 kept; `--out` must differ from it. Up to 1023 organisms and groups in all.
+
+### Looking inside an index
+
+```bash
+target/release/bycatch info -i idx
+```
+
+Prints the format, k, w, entry size, id and prefix bits, number of entries and size on
+disk, then one row per organism (minimizers, unique markers, unique fraction, group) and
+one per group (unique markers, members).
 
 ### Shrinking an index built before the id-sized layout
 
@@ -395,9 +412,11 @@ must leave at least 17 adapter bases in the read (insert ≤ 133 bp for 150 bp r
 | `distinct_markers` | different markers hit |
 | `index_markers` | unique markers of the organism in the index |
 | `diversity` | see above |
-| `note` | `host` and/or `low_diversity` |
+| `note` | `host`, `group`, `host_group` and/or `low_diversity` |
 | `ci95_low`, `ci95_high` | 95 % Wilson score interval of `percent` (all rows) |
 | `em_percent` | `percent` after the EM step below (organism rows only) |
+| `marker_density` | marker hits per minimizer in the organism's assigned fragments, divided by its unique fraction (what reads copied from its reference would give): about 1 for reads of the reference, lower for a diverged strain or relative (organisms with ≥ 20 such hits) |
+| `identity_est` | `marker_density`^(1/27): a rough per-base identity. Sequencing errors lower it too, so compare samples rather than read it as an ANI |
 
 The interval covers sampling noise only (`--every N`), not classification bias such as
 genome reads lost to `shared`. With 0 reads its upper end, about 3/n, is the most an
@@ -431,6 +450,9 @@ Trailing lines:
 - `# stopped_at_precision`: only when `--precision` ended the scan;
 - `# sampled_fragments`: reads (or pairs) classified;
 - `# duplicate_design_effect`: D above;
+- `# absent_below_percent`: the upper end of the 95 % interval for 0 fragments. An organism
+  with none is below this share; it is the smallest level a zero rules out, set by the
+  number of fragments sampled and D;
 - `# em_marker_error`: the ε used by the EM step;
 - `# contamination_percent`: only with `--host`; non-host assigned fragments divided by
   sampled fragments. The special categories are not counted as contamination;

@@ -23,6 +23,18 @@ const LOW_DIVERSITY: f64 = 0.25;
 /// Too few hits to judge.
 const MIN_HITS_FOR_FLAG: u64 = 20;
 
+/// Marker density of an organism's assigned fragments against what reads copied from its
+/// reference would show (its unique fraction), and the per-base identity that ratio
+/// suggests: density ≈ identity^k when every k-mer needs k matching bases. Sequencing
+/// errors lower it too, so it is a relative measure, not an ANI.
+fn divergence(own_hits: u64, minimizers: u64, unique_fraction: f64) -> Option<(f64, f64)> {
+    if own_hits < MIN_HITS_FOR_FLAG || minimizers == 0 || unique_fraction <= 0.0 {
+        return None;
+    }
+    let density = own_hits as f64 / minimizers as f64 / unique_fraction;
+    Some((density, density.min(1.0).powf(1.0 / K as f64)))
+}
+
 /// Distinct markers hit, divided by the number expected if the same number of
 /// hits fell uniformly over the organism's markers: markers * (1 - e^(-hits/markers)).
 fn diversity(hits: u64, distinct: u64, markers: u64) -> Option<f64> {
@@ -298,9 +310,9 @@ type Scratch = (Vec<u64>, Vec<(usize, usize)>);
 
 fn classify(idx: &Index, seen: &[AtomicU64], f: &Fragment, (mins, ranges): &mut Scratch) -> Call {
     mins.clear();
-    minimizers(&f.seq, mins);
+    minimizers(&f.seq, idx.w, mins);
     if let Some(m) = &f.mate {
-        minimizers(m, mins);
+        minimizers(m, idx.w, mins);
     }
     mins.sort_unstable();
     mins.dedup();
@@ -455,6 +467,8 @@ pub struct Report {
     pub reads: Vec<u64>,    // fragments assigned per organism
     pub hits: Vec<u64>,     // marker k-mer hits per organism
     pub distinct: Vec<u64>, // different markers hit per organism
+    pub own_hits: Vec<u64>, // marker hits of each organism in its own assigned fragments
+    pub own_minimizers: Vec<u64>, // minimizers of those fragments
     pub special: [u64; 6],  // fragments per SPECIAL category
     pub sampled: u64,
     /// records in the file, or up to the last sampled one when stopped early
@@ -496,7 +510,7 @@ impl Report {
         };
         writeln!(
             out,
-            "category\treads\tpercent\tmarker_hits\tdistinct_markers\tindex_markers\tdiversity\tnote\tci95_low\tci95_high\tem_percent"
+            "category\treads\tpercent\tmarker_hits\tdistinct_markers\tindex_markers\tdiversity\tnote\tci95_low\tci95_high\tem_percent\tmarker_density\tidentity_est"
         )?;
         for g in 0..idx.names.len() {
             let div = diversity(self.hits[g], self.distinct[g], idx.markers[g]);
@@ -510,9 +524,12 @@ impl Report {
             if self.hits[g] >= MIN_HITS_FOR_FLAG && div.is_some_and(|d| d < LOW_DIVERSITY) {
                 note.push("low_diversity");
             }
+            let dv = (g < idx.genomes)
+                .then(|| divergence(self.own_hits[g], self.own_minimizers[g], idx.unique_fraction(g)))
+                .flatten();
             writeln!(
                 out,
-                "{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+                "{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
                 idx.names[g],
                 self.reads[g],
                 self.pct(self.reads[g] as f64),
@@ -522,11 +539,13 @@ impl Report {
                 div.map_or(String::new(), |d| format!("{d:.3}")),
                 note.join(","),
                 ci(self.reads[g]),
-                self.pct(self.est[g])
+                self.pct(self.est[g]),
+                dv.map_or(String::new(), |d| format!("{:.3}", d.0)),
+                dv.map_or(String::new(), |d| format!("{:.4}", d.1))
             )?;
         }
         for (name, &x) in SPECIAL.iter().zip(&self.special) {
-            writeln!(out, "{name}\t{x}\t{:.4}\t\t\t\t\t\t{}\t", self.pct(x as f64), ci(x))?;
+            writeln!(out, "{name}\t{x}\t{:.4}\t\t\t\t\t\t{}\t\t\t", self.pct(x as f64), ci(x))?;
         }
         writeln!(out, "# total_fragments\t{}", self.total)?;
         if let Some(s) = self.stop {
@@ -534,6 +553,8 @@ impl Report {
         }
         writeln!(out, "# sampled_fragments\t{}", self.sampled)?;
         writeln!(out, "# duplicate_design_effect\t{:.3}", self.design)?;
+        // an organism with no fragment is below this, at 95 % (the CI's upper end for 0)
+        writeln!(out, "# absent_below_percent\t{:.4}", self.ci(0).1)?;
         writeln!(out, "# em_marker_error\t{:.6}", self.eps)?;
         if let (Some(c), Some(e)) = (self.contamination(), self.em_contamination()) {
             writeln!(out, "# contamination_percent\t{:.4}", self.pct(c as f64))?;
@@ -696,6 +717,7 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
     let mut reads = vec![0u64; n_org];
     let mut hits = vec![0u64; n_org];
     let mut distinct = vec![0u64; n_org];
+    let (mut own_hits, mut own_minimizers) = (vec![0u64; n_org], vec![0u64; n_org]);
     let mut special = [0u64; 6];
     let mut sampled = 0u64;
     let seen: Vec<AtomicU64> = (0..idx.len() / 64 + 1).map(|_| AtomicU64::new(0)).collect(); // one bit per index entry
@@ -743,6 +765,8 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
             let category = match decision {
                 Some((g, support)) => {
                     reads[g] += 1;
+                    own_hits[g] += c.hits.iter().find(|h| h.0 == g).map_or(0, |h| h.1) as u64;
+                    own_minimizers[g] += c.minimizers as u64;
                     assigned_hits += total as u64;
                     off_target += (total - support) as u64;
                     idx.names[g].as_str()
@@ -829,6 +853,8 @@ pub fn scan_sample(idx: &Index, opts: &Opts, host: Option<usize>, r1: &str, r2: 
         reads,
         hits,
         distinct,
+        own_hits,
+        own_minimizers,
         special,
         sampled,
         total: if stop.is_some() { last_rec } else { n },

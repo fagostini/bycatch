@@ -19,6 +19,10 @@ enum Cmd {
         /// Genomes read at once. Each needs about 1-2 GB of RAM per Gb of genome
         #[arg(short, long, default_value_t = 4)]
         jobs: usize,
+        /// Minimizer window in k-mers (5-31): smaller keeps more k-mers, for short reads,
+        /// at the cost of a larger index (density about 2 / (w + 1))
+        #[arg(long, default_value_t = kmer::W)]
+        window: usize,
     },
     /// Add genomes (TSV of `name<TAB>fasta_path`) to an index, without reading its genomes again
     Add {
@@ -32,6 +36,12 @@ enum Cmd {
         /// Genomes read at once
         #[arg(short, long, default_value_t = 4)]
         jobs: usize,
+    },
+    /// Print an index's layout, organisms (with unique markers) and groups
+    Info {
+        /// Index prefix
+        #[arg(short, long)]
+        index: String,
     },
     /// Rewrite an index in the current, smaller layout; results stay the same
     Repack {
@@ -142,9 +152,10 @@ fn sample_name(path: &str) -> String {
 
 fn main() {
     let result = match Cmd::parse() {
-        Cmd::Build { genomes, out, jobs } => index::build(&genomes, &out, jobs),
+        Cmd::Build { genomes, out, jobs, window } => index::build(&genomes, &out, jobs, window),
         Cmd::Add { index, genomes, out, jobs } => index::add(&index, &genomes, &out, jobs),
         Cmd::Repack { index, out } => index::repack(&index, &out),
+        Cmd::Info { index } => index::info(&index),
         Cmd::Scan { common, reads, unmatched_out, unmatched_n, depleted_out, mqc, name, r1, r2 } => {
             let opts = scan::Opts { reads_out: reads, unmatched_out, unmatched_n, depleted_out, ..common.opts() };
             let name = name.unwrap_or_else(|| sample_name(&r1));

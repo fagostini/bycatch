@@ -421,6 +421,8 @@ mod tests {
             reads,
             hits: vec![0; n],
             distinct: vec![0; n],
+            own_hits: vec![0; n],
+            own_minimizers: vec![0; n],
             special: [0; 6],
             sampled,
             total: sampled,

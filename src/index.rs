@@ -11,7 +11,7 @@
 //!
 //! Ids: organisms first, then groups (optional third column of the genome list), then
 //! the all-ones id for k-mers shared outside one group.
-use crate::kmer::{kmers_at, minimizers, K, W};
+use crate::kmer::{kmers_at, minimizers, K, W_RANGE};
 use crate::scan::{adapter_kmers, ADAPTER_K};
 use crate::Res;
 use rayon::prelude::*;
@@ -131,15 +131,15 @@ fn mask_adapters(seq: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Sorted, deduplicated minimizers of one genome, written raw to `tmp`. Returns their number.
-fn genome_run(path: &str, tmp: &str) -> Res<u64> {
+fn genome_run(path: &str, tmp: &str, w: usize) -> Res<u64> {
     let mut reader = needletail::parse_fastx_file(path).map_err(|e| format!("{path}: {e}"))?;
     let mut v = Vec::new();
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| format!("{path}: {e}"))?;
         let seq = rec.seq();
         match mask_adapters(&seq) {
-            Some(masked) => minimizers(&masked, &mut v),
-            None => minimizers(&seq, &mut v),
+            Some(masked) => minimizers(&masked, w, &mut v),
+            None => minimizers(&seq, w, &mut v),
         }
     }
     v.par_sort_unstable();
@@ -182,7 +182,11 @@ fn read_list(list: &str, text: &str) -> Res<Vec<Genome>> {
 /// `list`: TSV of `name<TAB>fasta_path[<TAB>group]`. Writes `<out>.kmers` and `<out>.meta`.
 /// At most `jobs` genomes are held in memory at once; the rest goes through
 /// temporary files `<out>.tmpN`, so memory does not grow with the number of genomes.
-pub fn build(list: &str, out: &str, jobs: usize) -> Res<()> {
+/// `w`: minimizer window, recorded in the index; scans use the same.
+pub fn build(list: &str, out: &str, jobs: usize, w: usize) -> Res<()> {
+    if !W_RANGE.contains(&w) {
+        return Err(format!("--window must be {} to {}, got {w}", W_RANGE.start(), W_RANGE.end()).into());
+    }
     let text = fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
     let genomes = read_list(list, &text)?;
     let n = genomes.len();
@@ -192,9 +196,9 @@ pub fn build(list: &str, out: &str, jobs: usize) -> Res<()> {
     let labels = Labels::new(&genomes.iter().map(|g| (g.0.clone(), g.2.clone())).collect::<Vec<_>>())
         .map_err(|e| format!("{list}: {e}"))?;
     let tmp: Vec<String> = (0..n).map(|g| format!("{out}.tmp{g}")).collect();
-    let result = build_runs(&genomes, &tmp, jobs).and_then(|totals| {
+    let result = build_runs(&genomes, &tmp, jobs, w).and_then(|totals| {
         let sources = run_sources(&tmp, 0)?;
-        merge(sources, &labels, &totals, out)
+        merge(sources, &labels, &totals, w, out)
     });
     for t in &tmp {
         let _ = fs::remove_file(t);
@@ -234,11 +238,12 @@ pub fn add(old: &str, list: &str, out: &str, jobs: usize) -> Res<()> {
     }
     let remap = old_ids(&idx, &labels);
     let tmp: Vec<String> = (0..genomes.len()).map(|g| format!("{out}.tmp{g}")).collect();
-    let result = build_runs(&genomes, &tmp, jobs).and_then(|new_totals| {
+    // new genomes use the old index's window: the same k-mers must be kept
+    let result = build_runs(&genomes, &tmp, jobs, idx.w).and_then(|new_totals| {
         let mut sources: Vec<Box<dyn Source + '_>> = vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0, remap })];
         sources.extend(run_sources(&tmp, idx.genomes)?);
         let totals: Vec<u64> = idx.totals[..idx.genomes].iter().chain(&new_totals).copied().collect();
-        merge(sources, &labels, &totals, out)
+        merge(sources, &labels, &totals, idx.w, out)
     });
     for t in &tmp {
         let _ = fs::remove_file(t);
@@ -255,7 +260,7 @@ pub fn repack(old: &str, out: &str) -> Res<()> {
     let idx = Index::load(old)?;
     let labels = idx.labels();
     let remap = old_ids(&idx, &labels);
-    merge(vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0, remap })], &labels, &idx.totals[..idx.genomes], out)
+    merge(vec![Box::new(OldIndex { idx: &idx, pos: 0, prefix: 0, remap })], &labels, &idx.totals[..idx.genomes], idx.w, out)
 }
 
 /// New id of each id of `idx`, by name.
@@ -327,7 +332,7 @@ impl Source for OldIndex<'_> {
     }
 }
 
-fn build_runs(genomes: &[Genome], tmp: &[String], jobs: usize) -> Res<Vec<u64>> {
+fn build_runs(genomes: &[Genome], tmp: &[String], jobs: usize, w: usize) -> Res<Vec<u64>> {
     // Plain threads, not rayon tasks: while one genome sorts, rayon work stealing
     // could start more genomes and break the memory bound.
     let next = AtomicUsize::new(0);
@@ -342,7 +347,7 @@ fn build_runs(genomes: &[Genome], tmp: &[String], jobs: usize) -> Res<Vec<u64>> 
                             return done;
                         }
                         eprintln!("reading {}", genomes[g].0);
-                        done.push((g, genome_run(&genomes[g].1, &tmp[g])));
+                        done.push((g, genome_run(&genomes[g].1, &tmp[g], w)));
                     }
                 })
             })
@@ -360,7 +365,7 @@ fn build_runs(genomes: &[Genome], tmp: &[String], jobs: usize) -> Res<Vec<u64>> 
 /// k-mer coming from two sources is in two genomes and becomes `SHARED`, or their
 /// group's id if both are in one group; one from a single source keeps its id.
 /// `totals`: minimizers per organism genome.
-fn merge(mut runs: Vec<Box<dyn Source + '_>>, labels: &Labels, totals: &[u64], out: &str) -> Res<()> {
+fn merge(mut runs: Vec<Box<dyn Source + '_>>, labels: &Labels, totals: &[u64], window: usize, out: &str) -> Res<()> {
     let names = &labels.names;
     let mut heap = BinaryHeap::new();
     let mut ids = vec![0u16; runs.len()];
@@ -417,8 +422,8 @@ fn merge(mut runs: Vec<Box<dyn Source + '_>>, labels: &Labels, totals: &[u64], o
     // so indexes without groups and up to 255 organisms stay as they were.
     let v3 = id_bits > 8 || names.len() > labels.genomes;
     let mut meta = match v3 {
-        true => format!("contam3\t{K}\t{W}\t{prefix_bits}\t{entry_bytes}\t{id_bits}\n"),
-        false => format!("contam2\t{K}\t{W}\t{prefix_bits}\t{entry_bytes}\n"),
+        true => format!("contam3\t{K}\t{window}\t{prefix_bits}\t{entry_bytes}\t{id_bits}\n"),
+        false => format!("contam2\t{K}\t{window}\t{prefix_bits}\t{entry_bytes}\n"),
     };
     for x in labels.genomes..names.len() {
         eprintln!("group {}: {} unique minimizers", names[x], unique[x]);
@@ -490,6 +495,49 @@ impl TableWriter {
     }
 }
 
+/// `bycatch info`: layout, organisms and groups of an index, as TSV on stdout.
+pub fn info(prefix: &str) -> Res<()> {
+    let idx = Index::load(prefix)?;
+    let meta = fs::read_to_string(format!("{prefix}.meta"))?;
+    let format = meta.split('\t').next().unwrap_or("");
+    let size: u64 = ["kmers", "table", "meta"]
+        .iter()
+        .filter_map(|e| fs::metadata(format!("{prefix}.{e}")).ok())
+        .map(|m| m.len())
+        .sum();
+    let mut out = String::new();
+    for (key, value) in [
+        ("format", format.to_string()),
+        ("k", K.to_string()),
+        ("w", idx.w.to_string()),
+        ("entry_bytes", idx.entry_bytes.to_string()),
+        ("id_bits", idx.id_bits.to_string()),
+        ("prefix_bits", idx.prefix_bits.to_string()),
+        ("entries", idx.len.to_string()),
+        ("size_bytes", size.to_string()),
+        ("organisms", idx.genomes.to_string()),
+        ("groups", (idx.names.len() - idx.genomes).to_string()),
+    ] {
+        out += &format!("# {key}\t{value}\n");
+    }
+    out += "organism\tminimizers\tunique\tunique_fraction\tgroup\n";
+    for g in 0..idx.genomes {
+        let frac = idx.markers[g] as f64 / idx.totals[g].max(1) as f64;
+        let group = idx.group_of[g].map_or("-", |x| idx.names[x].as_str());
+        out += &format!("{}\t{}\t{}\t{frac:.3}\t{group}\n", idx.names[g], idx.totals[g], idx.markers[g]);
+    }
+    if idx.names.len() > idx.genomes {
+        out += "group\tunique\tmembers\n";
+        for x in idx.genomes..idx.names.len() {
+            let members: Vec<&str> =
+                (0..idx.genomes).filter(|&g| idx.group_of[g] == Some(x)).map(|g| idx.names[g].as_str()).collect();
+            out += &format!("{}\t{}\t{}\n", idx.names[x], idx.markers[x], members.join(","));
+        }
+    }
+    print!("{out}");
+    Ok(())
+}
+
 pub struct Index {
     entries: memmap2::Mmap,
     /// None for version-1 indexes: one sorted array, no prefix table
@@ -510,6 +558,8 @@ pub struct Index {
     pub markers: Vec<u64>,
     /// minimizers per organism genome, shared ones included; 0 for groups
     totals: Vec<u64>,
+    /// minimizer window the index was built with
+    pub w: usize,
 }
 
 fn map(path: &str) -> Res<memmap2::Mmap> {
@@ -542,8 +592,12 @@ impl Index {
         let meta = fs::read_to_string(&meta_path).map_err(|e| format!("{meta_path}: {e}"))?;
         let mut lines = meta.lines();
         let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
-        let bad = || format!("{meta_path}: not a bycatch index for k={K}, w={W}");
-        if head.len() < 3 || head[1] != K.to_string() || head[2] != W.to_string() {
+        let bad = || format!("{meta_path}: not a bycatch index for k={K}");
+        if head.len() < 3 || head[1] != K.to_string() {
+            return Err(bad().into());
+        }
+        let w: usize = head[2].parse().map_err(|_| bad())?;
+        if !W_RANGE.contains(&w) {
             return Err(bad().into());
         }
         let (prefix_bits, entry_bytes, has_table, wide_bits) = match (head[0], &head[3..]) {
@@ -614,11 +668,17 @@ impl Index {
         };
         let key_mask = if entry_bytes == 4 { (1u64 << (KMER_BITS - prefix_bits)) - 1 } else { u64::MAX };
         let idx =
-            Index { entries, table, prefix_bits, entry_bytes, key_mask, id_bits, len, names, genomes, group_of, markers, totals };
+            Index { entries, table, prefix_bits, entry_bytes, key_mask, id_bits, len, names, genomes, group_of, markers, totals, w };
         if idx.table.is_some() && idx.offset(1 << prefix_bits) != len {
             return Err(format!("{prefix}.table: does not match {kmers_path}").into());
         }
         Ok(idx)
+    }
+
+    /// Share of an organism's minimizers that are its markers: what a read copied from
+    /// its reference would hit, on average.
+    pub fn unique_fraction(&self, g: usize) -> f64 {
+        self.markers[g] as f64 / self.totals[g].max(1) as f64
     }
 
     /// Number of entries.
@@ -750,8 +810,8 @@ mod tests {
             vec![Box::new(VecSource(a.clone().into_iter(), 0)), Box::new(VecSource(b.clone().into_iter(), 1))]
         };
         let names = Labels::new(&[("a".into(), None), ("b".into(), None)]).unwrap();
-        merge(sources(), &names, &[10, 10], &p("wide")).unwrap();
-        merge(sources(), &names, &[1 << 24, 0], &p("compact")).unwrap();
+        merge(sources(), &names, &[10, 10], crate::kmer::W, &p("wide")).unwrap();
+        merge(sources(), &names, &[1 << 24, 0], crate::kmer::W, &p("compact")).unwrap();
         let (wide, compact) = (Index::load(&p("wide")).unwrap(), Index::load(&p("compact")).unwrap());
         assert_eq!((wide.entry_bytes, compact.entry_bytes, compact.id_bits, compact.prefix_bits), (8, 4, 2, 24));
         repack(&p("compact"), &p("repacked")).unwrap();
