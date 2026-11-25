@@ -5,7 +5,7 @@ set -euo pipefail
 W=/var/tmp/bench_fair; cd $W
 export PATH=$W/env/bin:$PATH
 A=$W/genomes_alt; P=$W/pools; mkdir -p $P
-D=/home/agostif/Projects/bycatch/data
+D=${BYCATCH_DATA:-$(cd "$(dirname "$0")/../../data" && pwd)}  # the repo's data/, or $BYCATCH_DATA
 
 # off-panel genomes kept compressed in data/: ART needs plain FASTA
 [ -s $A/dog.fa ] || zcat $D/dog.fa.gz > $A/dog.fa
