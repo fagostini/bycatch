@@ -692,6 +692,52 @@ For reference, bycatch reports 0.053 % non-cod (mouse 0.024 %, frog 0.009 %), an
 - **sylph** is the smallest and needs no per-read work, but at the coverage of these sets it
   misses traces that bycatch, deacon and Kraken2 all see.
 
+## Not benchmarked: tuna (k-mer counter, reviewed 2026-11-27)
+
+[tuna](https://github.com/vicLeva/tuna) (C++20, GPL-3.0, v1.5.1) counts every canonical k-mer
+in FASTA/FASTQ files and writes `kmer<TAB>count` as TSV or KFF. Its peers are KMC3 and FastK,
+and those are the only tools its own benchmarks cover. It has no reference index, no read
+assignment and no host or contaminant concept, so no metric in `bench/fair/PROTOCOL.md`
+applies. It was not run.
+
+Method: reads are cut into superkmers (runs of k-mers that share a random minimizer, found
+with a two-stack sliding-window minimum). Superkmers go to partitions in memory or on disk.
+Each partition is then counted in a hash table. The input parser is a C++ port of helicase.
+
+What this offers bycatch:
+
+- **Accuracy: nothing.** tuna makes no calls, so it has no rule for shared k-mers, host
+  hits or off-panel reads.
+- **Minimizers: nothing new.** bycatch already emits one minimizer per window run, which is
+  the superkmer idea. Its monotone deque and tuna's two-stack minimum are both amortised
+  O(1) per k-mer.
+- **Partitioning: not needed.** tuna partitions because a full count table does not fit in
+  RAM (its human-reads run used 707 GB of temporary disk). bycatch looks up only panel
+  markers in a memory-mapped index, so it has no table to spill.
+- **Parsing: no gain (profiled 2026-11-27).** On a 2.22 M-pair real lane with the 95-organism
+  index, 16 threads, `--every 1`: reading, inflating and parsing both files alone takes
+  0.8 s wall, on threads of its own, against 5.8 s for the full scan. A faster parser
+  would not shorten the scan.
+- **Where scan time goes** (one thread, 1 M pairs, warm index, 9.4 µs per pair):
+  - index lookups: about 5.9 µs (63 %), about 210 ns per minimizer (27.7 per pair). Each
+    lookup is two random reads into a 45.8 GB memory map, so this is memory and TLB
+    latency.
+  - minimizers: 2.9 µs (31 %), about 12 ns per k-mer.
+  - duplicate key 0.35 µs, sort and dedup 0.15 µs, adapter check about 0.1 µs (it runs
+    only for the 3.6 % of pairs with no index hit).
+- **Batch-sorted lookups (tuna-style partitioning): unlikely to help.** A batch of 10,000
+  pairs gives about 280,000 lookups spread over 45.8 GB, roughly one per 160 KB. They
+  still land on separate pages.
+- **Faster minimizers: little left without changing the scheme.** A fixed ring buffer and
+  a byte lookup table in place of the `VecDeque` gave byte-identical reports. The
+  single-thread scan went from 25.9 s to 25.2 s (3 %), and the 14-thread scan was
+  unchanged (5.8–6.6 s for both, within noise). The rest of the cost is likely the
+  unpredictable branch of the monotone queue and the hash. Only a branchless or SIMD
+  scheme would remove it, and that would mean a new hash or canonical rule, and every
+  index rebuilt.
+- **Panel building: possible.** tuna could count k-mers in host read sets to find frequent
+  host k-mers to drop from a panel. bycatch does not need this today.
+
 ## Per-read k-mer classifiers
 
 These tools work like bycatch: they call each read from exact k-mer or minimizer hits. They
